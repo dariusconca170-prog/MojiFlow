@@ -1,0 +1,85 @@
+[package]
+name = "medialingual-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Universal Japanese sentence-mining overlay"
+license = "MIT"
+repository = "https://example.invalid/medialingual-native"
+default-run = "medialingual-native"
+
+[features]
+default = []
+whisper = ["dep:whisper-rs"]
+cuda = ["whisper-rs?/cuda"]
+vulkan = ["whisper-rs?/vulkan"]
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+    "default_fonts",
+] }
+egui = "0.36.2"
+egui_extras = "0.36.2"
+tokio = { version = "1.53.2", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "net",
+    "io-util",
+] }
+crossbeam-channel = "0.5"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.21", features = ["env-filter", "fmt"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9"
+directories = "6.0.0"
+lindera = { version = "6.2.0", features = ["embed-ipadic"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+cpal = "0.18.2"
+xcap = "0.9.8"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+global-hotkey = "0.8.0"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+base64 = "0.22"
+mp3lame-encoder = "0.2.5"
+encoding_rs = "0.8"
+chardetng = "0.1"
+serde_json = "1"
+lru = "0.12"
+humantime = "2"
+rand = "0.9"
+whisper-rs = { version = "0.16.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+x11rb = "0.14"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+insta = "1"
+
+[[bin]]
+name = "medialingual-native"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
