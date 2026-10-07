@@ -1,3 +1,9 @@
 target/
 assets/dict/*.sqlite
 *.log
+
+# never commit key material
+/key
+/key.pub
+/id_*
+*.pem
