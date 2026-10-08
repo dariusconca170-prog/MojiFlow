@@ -4,3 +4,4 @@
 
 pub mod fonts;
 pub mod overlay;
+pub mod popover;

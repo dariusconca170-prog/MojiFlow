@@ -13,7 +13,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::config::DictionaryConfig;
-use crate::deinflect::deinflect;
+use crate::deinflect::{deinflect, Candidate};
 use crate::error::DictionaryError;
 
 /// One JMdict entry, senses merged, with pitch/frequency attached when known.
@@ -31,6 +31,19 @@ pub struct DictEntry {
     pub pitch: Option<String>,
     /// Corpus frequency rank (1 = most common), if present.
     pub frequency_rank: Option<i64>,
+}
+
+/// A surface form plus the de-inflection candidate that matched it and the entries found.
+///
+/// Returned by [`Dictionary::resolve_detailed`] so the M4 popover can show *why* a surface
+/// resolved (e.g. 読んだ → 読む via `past`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// The dictionary-form candidate whose lookup succeeded (the surface itself when it is
+    /// already a dictionary form, with an empty `reasons` chain).
+    pub candidate: Candidate,
+    /// Dictionary entries for `candidate.term`.
+    pub entries: Vec<DictEntry>,
 }
 
 /// Lookup engine. Not `Sync` (rusqlite connections are per-thread); construct one per
@@ -129,15 +142,27 @@ impl Dictionary {
 
     /// Resolve a surface form: try it verbatim, then every de-inflection candidate in
     /// order, returning the first candidate that has dictionary entries. This is the
-    /// path the M4 popover and the M3 integration gate use.
+    /// path the M3 integration gate uses.
     pub fn resolve(&mut self, surface: &str) -> Result<Vec<DictEntry>, DictionaryError> {
+        Ok(self
+            .resolve_detailed(surface)?
+            .map(|resolution| resolution.entries)
+            .unwrap_or_default())
+    }
+
+    /// Like [`Self::resolve`] but also returns which candidate matched and its de-inflection
+    /// chain — the M4 popover uses this to explain conjugated surfaces.
+    pub fn resolve_detailed(
+        &mut self,
+        surface: &str,
+    ) -> Result<Option<Resolution>, DictionaryError> {
         for candidate in deinflect(surface) {
             let entries = self.lookup(&candidate.term)?;
             if !entries.is_empty() {
-                return Ok(entries);
+                return Ok(Some(Resolution { candidate, entries }));
             }
         }
-        Ok(Vec::new())
+        Ok(None)
     }
 
     /// True when the given databases exist (used by the UI status strip).
@@ -350,6 +375,26 @@ mod tests {
         let entries = d.resolve("猫").expect("resolve");
         assert_eq!(entries[0].term, "猫");
         assert!(d.resolve("zzz-unknown").expect("resolve").is_empty());
+    }
+
+    #[test]
+    fn resolve_detailed_reports_the_deinflection_chain() {
+        let mut d = fixture();
+        let resolution = d
+            .resolve_detailed("食べました")
+            .expect("resolve")
+            .expect("entry");
+        assert_eq!(resolution.candidate.term, "食べる");
+        assert!(
+            !resolution.candidate.reasons.is_empty(),
+            "conjugated surface must carry a reason chain"
+        );
+        assert_eq!(resolution.entries[0].term, "食べる");
+
+        // A word that is already a dictionary form has an empty chain.
+        let verbatim = d.resolve_detailed("猫").expect("resolve").expect("entry");
+        assert_eq!(verbatim.candidate.term, "猫");
+        assert!(verbatim.candidate.reasons.is_empty());
     }
 
     #[test]

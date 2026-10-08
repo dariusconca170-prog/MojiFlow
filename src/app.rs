@@ -8,10 +8,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::capture::window::GlobalPointer;
 use crate::clock::{self, manual::ManualClock, PlaybackClock};
 use crate::config::Config;
+use crate::dict::Dictionary;
 use crate::error::MlError;
+use crate::gui::popover::PopoverData;
 use crate::subs::SubtitleTrack;
+use crate::tokenize::{JapaneseTokenizer, Token};
 
 /// Commands sent from the UI thread to worker threads/tasks.
 #[derive(Debug)]
@@ -167,6 +171,40 @@ pub struct App {
     /// Workers that must be joined/stopped at exit.
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
     last_sync_state: Option<crate::clock::SyncState>,
+
+    // --- M4: interactive overlay (click-through, hover, dictionary popover) ---
+    /// Dictionary opened from config; `None` when its database is missing (toast once).
+    pub dictionary: Option<Dictionary>,
+    /// IPADIC tokenizer, built once (decoding the embedded dictionary is not free).
+    tokenizer: Option<JapaneseTokenizer>,
+    /// OS pointer/modifier probe used to detect hover while the window is click-through.
+    pointer: GlobalPointer,
+    /// Latest window-local cursor position in egui points, if the OS could report it.
+    pub cursor_local: Option<egui::Pos2>,
+    /// Whether Shift is currently held (queried globally) — the "Shift-lock".
+    pub shift_held: bool,
+    /// Interactive regions computed during the previous frame (tokens, popover, status).
+    pub interactive_rects: Vec<egui::Rect>,
+    /// True while the window currently accepts mouse input (hittest enabled).
+    pub hit_testing: bool,
+    /// Token under the cursor this frame.
+    pub hover_token: Option<usize>,
+    /// Token pinned by a click; its popover stays open when the cursor moves away.
+    pub pinned_token: Option<usize>,
+    /// The popover currently shown, if any.
+    pub popover: Option<PopoverState>,
+    /// Tokenization cache keyed by the source text.
+    token_cache: Option<(String, Arc<Vec<Token>>)>,
+    /// Whether the pointer-unavailable warning has been surfaced to the user.
+    pointer_warned: bool,
+}
+
+/// Open popover: which token it describes, the display model, and the rectangle it last
+/// occupied (so it can stay open while the cursor is over the panel itself).
+pub struct PopoverState {
+    pub token_index: usize,
+    pub data: PopoverData,
+    pub rect: Option<egui::Rect>,
 }
 
 impl App {
@@ -213,6 +251,23 @@ impl App {
             issues.push(MlError::Clock(err));
         }
 
+        // M4: dictionary + tokenizer. A missing JMdict DB is reported once as a toast but
+        // must not stop the overlay from rendering subtitles.
+        let dictionary = match Dictionary::open(&config.dictionary) {
+            Ok(dict) => Some(dict),
+            Err(err) => {
+                issues.push(MlError::Dictionary(err));
+                None
+            }
+        };
+        let tokenizer = match JapaneseTokenizer::new() {
+            Ok(tokenizer) => Some(tokenizer),
+            Err(err) => {
+                issues.push(MlError::Dictionary(err));
+                None
+            }
+        };
+
         Self {
             user_offset_ms: config.subtitle.user_offset_ms,
             config,
@@ -236,6 +291,18 @@ impl App {
                 }
             })],
             last_sync_state: None,
+            dictionary,
+            tokenizer,
+            pointer: GlobalPointer::new(),
+            cursor_local: None,
+            shift_held: false,
+            interactive_rects: Vec::new(),
+            hit_testing: false,
+            hover_token: None,
+            pinned_token: None,
+            popover: None,
+            token_cache: None,
+            pointer_warned: false,
         }
     }
 
@@ -303,6 +370,162 @@ impl App {
         self.user_offset_ms
     }
 
+    // -------------------------------------------------------------------------------------
+    // M4: tokenization cache, interactive hit-testing, dictionary popover
+    // -------------------------------------------------------------------------------------
+
+    /// Tokenize `text`, reusing the previous result when the text is unchanged. Tokenizing
+    /// every frame would be wasteful; the cache key is the exact source text.
+    pub fn tokens_cached(&mut self, text: &str) -> Arc<Vec<Token>> {
+        if let Some((cached, tokens)) = &self.token_cache {
+            if cached == text {
+                return Arc::clone(tokens);
+            }
+        }
+        let tokens = match &self.tokenizer {
+            Some(tokenizer) => match tokenizer.tokenize(text) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    tracing::warn!(error = %err, "tokenization failed");
+                    self.toasts.push(err.to_string(), true);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let arc = Arc::new(tokens);
+        self.token_cache = Some((text.to_owned(), Arc::clone(&arc)));
+        // A new sentence invalidates any hover/pin state tied to the previous token indices.
+        self.hover_token = None;
+        self.pinned_token = None;
+        self.popover = None;
+        arc
+    }
+
+    /// Query the OS for the pointer position (window-local) and Shift state. Safe to call
+    /// every frame; failures surface once and then fall back to always-interactive.
+    pub fn update_cursor(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        use raw_window_handle::HasWindowHandle as _;
+
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let handle = frame.window_handle().ok().map(|handle| handle.as_raw());
+        self.cursor_local = match handle {
+            Some(handle) => match self.pointer.cursor(handle, ppp) {
+                Ok(pos) => {
+                    tracing::trace!(x = pos.x, y = pos.y, "global cursor");
+                    Some(pos)
+                }
+                Err(err) => {
+                    if !self.pointer_warned {
+                        self.pointer_warned = true;
+                        tracing::warn!(error = %err, "global cursor query unavailable");
+                        self.toasts.push(err.to_string(), true);
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
+        self.shift_held = self.pointer.shift_held().unwrap_or(false);
+    }
+
+    /// Enable OS hit-testing exactly when the cursor is over an interactive region (or
+    /// Shift-lock is held). Everything else stays click-through, so the video underneath
+    /// keeps receiving clicks.
+    pub fn apply_passthrough(&mut self, ctx: &egui::Context) {
+        let interactive = match self.cursor_local {
+            Some(pos) => {
+                self.shift_held || self.interactive_rects.iter().any(|rect| rect.contains(pos))
+            }
+            // No global cursor (native Wayland): the overlay must stay interactive so it can
+            // still be used; manual-region mode is the M7 fallback. Documented in AGENTS.md.
+            None => true,
+        };
+        if interactive != self.hit_testing {
+            tracing::debug!(
+                interactive,
+                shift = self.shift_held,
+                "toggling overlay mouse passthrough"
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!interactive));
+            self.hit_testing = interactive;
+        }
+    }
+
+    /// Look up a token surface and build its popover model (dictionary may be absent).
+    pub fn lookup_popover(&mut self, surface: &str) -> PopoverData {
+        let resolution = match &mut self.dictionary {
+            Some(dictionary) => match dictionary.resolve_detailed(surface) {
+                Ok(resolution) => resolution,
+                Err(err) => {
+                    tracing::warn!(error = %err, surface, "dictionary lookup failed");
+                    return PopoverData::from_resolution(surface, None);
+                }
+            },
+            None => None,
+        };
+        PopoverData::from_resolution(surface, resolution.as_ref())
+    }
+
+    /// Recompute which popover (if any) should be shown for this frame.
+    ///
+    /// Selection order: a click-pinned token, then the hovered token, then keeping the open
+    /// popover alive while the cursor is over the panel itself. A primary click on a token
+    /// toggles the pin; Escape clears it.
+    pub fn update_popover(
+        &mut self,
+        hover: Option<usize>,
+        cursor: Option<egui::Pos2>,
+        clicked: bool,
+        escape: bool,
+        tokens: &[Token],
+    ) {
+        if escape {
+            self.pinned_token = None;
+        }
+        if clicked {
+            match hover {
+                Some(index) => {
+                    self.pinned_token = (self.pinned_token != Some(index)).then_some(index);
+                }
+                None => {
+                    let over_panel = cursor
+                        .zip(self.popover.as_ref().and_then(|popover| popover.rect))
+                        .is_some_and(|(pos, rect)| rect.contains(pos));
+                    if !over_panel {
+                        self.pinned_token = None;
+                    }
+                }
+            }
+        }
+
+        let over_panel = cursor
+            .zip(self.popover.as_ref().and_then(|popover| popover.rect))
+            .is_some_and(|(pos, rect)| rect.contains(pos));
+        let selected = self.pinned_token.or(hover).or_else(|| {
+            over_panel
+                .then(|| self.popover.as_ref().map(|p| p.token_index))
+                .flatten()
+        });
+
+        match selected {
+            Some(index) if self.popover.as_ref().map(|p| p.token_index) != Some(index) => {
+                let surface = tokens
+                    .get(index)
+                    .map(|token| token.surface.clone())
+                    .unwrap_or_default();
+                let data = self.lookup_popover(&surface);
+                self.popover = Some(PopoverState {
+                    token_index: index,
+                    data,
+                    rect: None,
+                });
+            }
+            Some(_) => {}
+            None => self.popover = None,
+        }
+    }
+
     /// Advance timing for this frame: pick the active cue from `clock + offset`.
     pub fn update_timing(&mut self) {
         let effective = clock::effective_time(self.clock.as_ref(), self.user_offset_ms);
@@ -367,7 +590,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_config_issues();
         self.poll_events();
 
@@ -384,6 +607,7 @@ impl eframe::App for App {
 
         self.handle_local_keys(ui);
         self.update_timing();
+        self.update_cursor(frame, ui.ctx());
 
         // Surface clock sync-state transitions as toasts (e.g. mpv connected/lost).
         let sync = self.clock.sync_state();
@@ -396,8 +620,14 @@ impl eframe::App for App {
 
         crate::gui::overlay::show(self, ui);
 
-        // While the clock is running, keep a slow tick so the active cue advances;
-        // when paused/disconnected egui idles with no repaints at all.
+        // Enable/disable click-through from the interactive regions the overlay just
+        // computed. Deferred viewport commands apply after this frame.
+        self.apply_passthrough(ui.ctx());
+
+        // The global-cursor hover mechanism needs a steady tick even when idle (the window
+        // receives no mouse events while click-through), so poll at ~30 Hz; the clock's own
+        // tick keeps cues advancing.
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
         if self.clock.is_playing() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }

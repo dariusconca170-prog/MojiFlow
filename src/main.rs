@@ -120,6 +120,9 @@ fn main() -> anyhow::Result<()> {
         .with_always_on_top()
         .with_decorations(config.window.show_decorations)
         .with_taskbar(false)
+        // Start click-through; `App::apply_passthrough` re-enables input only while the
+        // cursor is over an interactive region (see AGENTS.md).
+        .with_mouse_passthrough(true)
         .with_position([config.window.rect[0], config.window.rect[1]])
         .with_inner_size([config.window.rect[2], config.window.rect[3]]);
 

@@ -33,7 +33,7 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 ## Platform caveats (living document)
 
 - **egui has no CJK glyphs.** A Japanese font is loaded at startup: system font probe (Noto Sans CJK JP, Yu Gothic, Meiryo, IPAGothic) with an embedded OFL fallback font in `assets/fonts/`. Covered by a render test asserting kanji, kana, `々ー〜`.
-- **Transparent + click-through + hover conflict.** A passthrough window gets no mouse events. Mechanism: the overlay is click-through by default; each frame the UI computes the union of interactive rects (token rects, popover, toolbar) and queries the *global* cursor position from the OS; if the cursor is inside an interactive rect it issues a viewport command to re-enable hit-testing, otherwise it disables it. Global cursor query lives in `capture::window` per platform (X11 `x11rb`, Windows `windows-sys`/`GetCursorPos`; on native Wayland global cursor query is unavailable → fallback documented below).
+- **Transparent + click-through + hover conflict.** A passthrough window gets no mouse events. Mechanism (M4, implemented): the overlay is click-through by default (`ViewportBuilder::with_mouse_passthrough(true)`); each frame the UI computes the union of interactive rects (per-token rects derived from the shaped Galley by byte→char→glyph mapping, plus the open popover) and queries the *global* cursor position from the OS. `App::apply_passthrough` re-enables hit-testing (sends `ViewportCommand::MousePassthrough(false)`) only while the cursor is inside an interactive rect, otherwise disables it — and only when the desired state changes, to avoid a per-frame X round trip. A globally-held Shift forces interactive (Shift-lock). Because a click-through window receives no repaints of its own, the overlay polls the cursor at ~30 Hz (`request_repaint_after(33ms)`). Global cursor + modifier query lives in `capture::window` (`GlobalPointer`): Linux/X11 uses `x11rb` `QueryPointer` / `QueryKeymap` (modifier map cached) on a second connection and returns window-local egui points; **Windows (`GetCursorPos`) and macOS are not implemented yet (M7)** — the platform fallback returns a typed `WindowError` and the overlay stays interactive, so it is never silently broken.
 - **Global hotkeys never bind bare letters.** Defaults: `Ctrl+Alt+S` export, `Ctrl+Alt+[`/`]` offset ∓200 ms, `Ctrl+Alt+L` lock, `Ctrl+Alt+H` hide/show, `Ctrl+Alt+O` open subtitle file. Bare keys work only while the overlay is focused or its popover is hovered.
 - **Wayland.** Session type detected at startup (`XDG_SESSION_TYPE`/`WAYLAND_DISPLAY`) and logged. X11/XWayland is the primary path. On native Wayland: try `xdg-desktop-portal` via `ashpd` for GlobalShortcuts/Screenshot; otherwise run "manual region" mode (user drags overlay over the video; capture uses that rect). Global cursor query and always-on-top are restricted in native Wayland → manual region mode is the documented fallback.
 - **No universal media clock.** `PlaybackClock` trait with implementations: `ManualClock` (hotkey-driven), `MpvIpcClock` (JSON IPC over Unix socket / named pipe), `MprisClock` (Linux, zbus), `WhisperLiveClock` (timestamped on arrival). Selected in `config.toml` / settings.
@@ -43,7 +43,18 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 
 ## Known platform caveats / limits
 
-(filled in as encountered)
+- **Windows/macOS global cursor query is not implemented yet** (arrives with M7). The `GlobalPointer` fallback returns `WindowError::CursorQueryUnavailable`; the overlay logs it once as a toast and stays fully interactive (never silently dead). X11 is the verified path.
+- **Idle CPU:** the overlay repaints at ~30 Hz even with the video paused, because a click-through window receives no mouse events to wake it. This is the cost of hover-while-click-through; the window is small and the paint is cheap.
+- **Popover selection model:** it appears for the hovered token, stays open while the cursor is over the panel, and a primary click pins/unpins it; `Escape` clears the pin. Clicking "empty" overlay space cannot dismiss it (that space stays click-through on purpose) — hover away, click the token again, or Escape instead.
+
+## Manual QA checklist
+
+- **M4 (X11, verified 2026-10-08 with python-xlib pointer warping):**
+  - Launch; the overlay is click-through — the window underneath receives clicks on empty overlay areas.
+  - Warp/move the pointer over a subtitle token → the token highlights and the window becomes interactive (`toggling overlay mouse passthrough interactive=true` at debug level).
+  - Move off the token → click-through again (`interactive=false`).
+  - Hold Shift while the pointer is elsewhere → interactive (`interactive=true, shift=true`); release → click-through.
+  - Hover a token → dictionary popover (term/reading/pitch contour/frequency/POS/glosses); a conjugated surface shows its de-inflection chain.
 
 ## Dictionary data (built by `cargo xtask build-dict`, gitignored artifacts)
 
