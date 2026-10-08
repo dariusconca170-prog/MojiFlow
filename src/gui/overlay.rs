@@ -312,8 +312,15 @@ fn paint_status_strip(app: &App, ui: &mut egui::Ui, area: Rect) {
     } else {
         "dict missing"
     };
+    let audio = match &app.audio {
+        Some(capture) => match capture.ring() {
+            Some(ring) => format!("audio {:.1}s buf", ring.buffered_seconds()),
+            None => "audio retrying…".to_owned(),
+        },
+        None => "audio off".to_owned(),
+    };
     let text = format!(
-        "MediaLingual · {dictionary} · offset {:+} ms · {}",
+        "MediaLingual · {dictionary} · {audio} · offset {:+} ms · {}",
         app.subtitle_offset_ms(),
         if app.hit_testing {
             "interactive"

@@ -19,6 +19,7 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 - **UI thread**: eframe/egui (`src/gui/`), never blocks. Workers push `CoreEvent`s over a bounded channel and call `ctx.request_repaint()`.
 - **Tokio runtime** on a dedicated thread for HTTP (AnkiConnect, STT HTTP backend) and socket IPC (mpv).
 - **Dedicated OS threads**: audio capture callback (real-time safe, no alloc/locks), whisper inference (feature-gated), screenshot capture.
+- **Capture (M5)**: cpal runs on a dedicated thread (`src/audio/capture.rs`) because `cpal::Stream` is `!Send` on ALSA; the callback pushes mono `f32` into a lock-free SPSC ring (`src/audio/ring.rs` — `AtomicU32` bit-slots + Release/Acquire horizon + one-sample slack, so no locks/allocs on the audio thread), export converts to MP3 via LAME (`src/audio/encode.rs`), screenshots use `xcap` and JPEG-encode via `image` (`src/capture/screen.rs`).
 - **Message bus**: `UiCommand` (UI → workers), `CoreEvent` (workers → UI), bounded `tokio::sync::mpsc` + `crossbeam-channel` where a sync boundary is needed.
 - **Shutdown**: `CancellationToken` stops all workers; test asserts clean exit with no leaked threads.
 
@@ -37,7 +38,7 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 - **Global hotkeys never bind bare letters.** Defaults: `Ctrl+Alt+S` export, `Ctrl+Alt+[`/`]` offset ∓200 ms, `Ctrl+Alt+L` lock, `Ctrl+Alt+H` hide/show, `Ctrl+Alt+O` open subtitle file. Bare keys work only while the overlay is focused or its popover is hovered.
 - **Wayland.** Session type detected at startup (`XDG_SESSION_TYPE`/`WAYLAND_DISPLAY`) and logged. X11/XWayland is the primary path. On native Wayland: try `xdg-desktop-portal` via `ashpd` for GlobalShortcuts/Screenshot; otherwise run "manual region" mode (user drags overlay over the video; capture uses that rect). Global cursor query and always-on-top are restricted in native Wayland → manual region mode is the documented fallback.
 - **No universal media clock.** `PlaybackClock` trait with implementations: `ManualClock` (hotkey-driven), `MpvIpcClock` (JSON IPC over Unix socket / named pipe), `MprisClock` (Linux, zbus), `WhisperLiveClock` (timestamped on arrival). Selected in `config.toml` / settings.
-- **Linux loopback audio** uses PulseAudio/PipeWire *monitor* sources (device picker persists the choice); hot-unplug handled by a reconnect loop with backoff. **Windows** uses WASAPI loopback through cpal.
+- **Linux loopback audio** uses PulseAudio/PipeWire *monitor* sources (device picker persists the choice); hot-unplug handled by a reconnect loop with backoff. **Windows** uses WASAPI loopback through cpal. When no loopback/monitor source matches by name, capture falls back to the default input device and logs it; `AudioCapture::status()` reports retries and `App` toasts transitions.
 - **Screenshots** target the identified video window (title match or user-picked from a window list); the overlay hides itself for the capture frame when it would appear in the shot.
 - **Audio export is "last-heard audio"**: the ring buffer reflects real playback, so if the user paused/replayed, buffered audio may not match the cue. Documented in the UI; user can re-trigger after the line replays.
 
@@ -46,6 +47,7 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 - **Windows/macOS global cursor query is not implemented yet** (arrives with M7). The `GlobalPointer` fallback returns `WindowError::CursorQueryUnavailable`; the overlay logs it once as a toast and stays fully interactive (never silently dead). X11 is the verified path.
 - **Idle CPU:** the overlay repaints at ~30 Hz even with the video paused, because a click-through window receives no mouse events to wake it. This is the cost of hover-while-click-through; the window is small and the paint is cheap.
 - **Popover selection model:** it appears for the hovered token, stays open while the cursor is over the panel, and a primary click pins/unpins it; `Escape` clears the pin. Clicking "empty" overlay space cannot dismiss it (that space stays click-through on purpose) — hover away, click the token again, or Escape instead.
+- **`libgbm-dev` is required to *link* on Linux.** Merely declaring `xcap` doesn't pull in `-lgbm`, but actually using it (M5 `screen.rs`) does — the linker needs `libgbm.so`, and runtime-only `libgbm1` is not enough. On Debian/Ubuntu: `sudo apt install libgbm-dev`.
 
 ## Manual QA checklist
 
@@ -55,6 +57,10 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
   - Move off the token → click-through again (`interactive=false`).
   - Hold Shift while the pointer is elsewhere → interactive (`interactive=true, shift=true`); release → click-through.
   - Hover a token → dictionary popover (term/reading/pitch contour/frequency/POS/glosses); a conjugated surface shows its de-inflection chain.
+- **M5 (smoke-verified 2026-10-08 on X11):**
+  - Launch → toast `audio capture: <device> @ <rate> Hz`; the status strip shows `audio N.Ns buf` rising as the ring fills; log line `audio capture started device=... format=F32`.
+  - Unplug/rename the capture device → reconnect retry toast and `audio retrying…` in the strip.
+  - Unit gates: ring wraparound/clamp/underflow, MP3 frame-sync output, JPEG round-trip decode.
 
 ## Dictionary data (built by `cargo xtask build-dict`, gitignored artifacts)
 

@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn zero_length_range_is_empty_not_old() {
-        let mut ring = AudioRing::with_capacity(1, 8);
+        let ring = AudioRing::with_capacity(1, 8);
         for i in 0..20u32 {
             ring.push(i as f32);
         }
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn buffered_seconds_saturates_at_capacity() {
         let ring = AudioRing::with_capacity(10, 11); // usable 10 samples
-        ring.push_mono(&vec![0.0; 25]);
+        ring.push_mono(&[0.0; 25]);
         assert!((ring.buffered_seconds() - 1.0).abs() < 1e-6);
     }
 

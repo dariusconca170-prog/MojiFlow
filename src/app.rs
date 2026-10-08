@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::audio::capture::AudioCapture;
 use crate::capture::window::GlobalPointer;
 use crate::clock::{self, manual::ManualClock, PlaybackClock};
 use crate::config::Config;
@@ -197,6 +198,14 @@ pub struct App {
     token_cache: Option<(String, Arc<Vec<Token>>)>,
     /// Whether the pointer-unavailable warning has been surfaced to the user.
     pointer_warned: bool,
+
+    // --- M5: loopback audio capture ---
+    /// Background capture thread; `None` on the rare failure to spawn it.
+    pub audio: Option<AudioCapture>,
+    /// Last seen active capture identity (`device|rate|channels`) for transition toasts.
+    audio_active_key: Option<String>,
+    /// Last seen retry error, surfaced as a toast once per change.
+    audio_last_error: Option<String>,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -268,6 +277,10 @@ impl App {
             }
         };
 
+        // M5: loopback audio capture into the "last-heard audio" ring. Starts on a dedicated
+        // thread; retries and surfaces via `update_audio_state`.
+        let audio = AudioCapture::start(&config.audio);
+
         Self {
             user_offset_ms: config.subtitle.user_offset_ms,
             config,
@@ -303,6 +316,9 @@ impl App {
             popover: None,
             token_cache: None,
             pointer_warned: false,
+            audio: Some(audio),
+            audio_active_key: None,
+            audio_last_error: None,
         }
     }
 
@@ -526,6 +542,45 @@ impl App {
         }
     }
 
+    /// Poll the capture thread and surface state changes (started / retrying) as one-off toasts.
+    pub fn update_audio_state(&mut self) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        let status = audio.status();
+        let key = format!(
+            "{}|{}|{}",
+            status.device, status.sample_rate, status.channels
+        );
+        match &status.last_error {
+            Some(err) => {
+                if self.audio_last_error.as_deref() != Some(err.as_str()) {
+                    self.audio_last_error = Some(err.clone());
+                    self.toasts
+                        .push(format!("audio capture retrying: {err}"), true);
+                }
+            }
+            None => {
+                if !status.device.is_empty() && self.audio_active_key.as_deref() != Some(&key) {
+                    self.audio_active_key = Some(key);
+                    tracing::info!(
+                        device = %status.device,
+                        rate = status.sample_rate,
+                        "audio capture active"
+                    );
+                    self.toasts.push(
+                        format!(
+                            "audio capture: {} @ {} Hz",
+                            status.device, status.sample_rate
+                        ),
+                        false,
+                    );
+                }
+                self.audio_last_error = None;
+            }
+        }
+    }
+
     /// Advance timing for this frame: pick the active cue from `clock + offset`.
     pub fn update_timing(&mut self) {
         let effective = clock::effective_time(self.clock.as_ref(), self.user_offset_ms);
@@ -583,6 +638,7 @@ impl App {
     pub fn shutdown_workers(&mut self) {
         let _ = self.loader_tx.send(UiCommand::Shutdown);
         self.clock.shutdown();
+        self.audio = None; // drop joins the capture thread
         for hook in std::mem::take(&mut self.shutdown_hooks) {
             hook();
         }
@@ -593,6 +649,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_config_issues();
         self.poll_events();
+        self.update_audio_state();
 
         // Accept subtitle files dropped onto the overlay.
         let dropped = ui.input(|i| i.raw.dropped_files.clone());
