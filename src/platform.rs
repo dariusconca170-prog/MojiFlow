@@ -50,6 +50,10 @@ pub fn detect() -> SessionKind {
     )
 }
 
+/// Title of the overlay window. The always-on-top enforcer matches on this
+/// (`_NET_WM_NAME`), so it must match `main.rs`'s `ViewportBuilder` title exactly.
+pub const OVERLAY_TITLE: &str = "MediaLingual";
+
 impl SessionKind {
     /// Short label for the startup log line and status strip.
     pub fn label(self) -> &'static str {

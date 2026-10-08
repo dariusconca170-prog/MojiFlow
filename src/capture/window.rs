@@ -53,6 +53,18 @@ impl GlobalPointer {
     pub fn shift_held(&mut self) -> Result<bool, WindowError> {
         platform_shift_held(self)
     }
+
+    /// Set (or clear) EWMH always-on-top on every top-level window whose
+    /// `_NET_WM_NAME` equals `title`.
+    ///
+    /// eframe 0.36 silently drops `ViewportBuilder::with_window_level`/`with_always_on_top`
+    /// (its winit integration has no `WindowLevel` handling at all), so the hint never
+    /// becomes `_NET_WM_STATE_ABOVE` and the overlay sits at Z-order-luck. The app calls
+    /// this periodically (self-healing); it only sends a ClientMessage when the WM state
+    /// actually differs from `enable`, so it is cheap to re-run.
+    pub fn set_always_on_top(&self, title: &str, enable: bool) -> Result<(), WindowError> {
+        platform_set_always_on_top(self, title, enable)
+    }
 }
 
 impl Default for GlobalPointer {
@@ -166,6 +178,109 @@ fn x11_window_id(window: RawWindowHandle) -> Result<u32, WindowError> {
     }
 }
 
+/// EWMH `_NET_WM_STATE` client-message payload (32-bit data array):
+/// `[action, property, second_property, source, unused]` — action 1 = add, 0 = remove,
+/// source 1 = application. This is the canonical shape KWin/other EWMH WMs act on.
+#[cfg(target_os = "linux")]
+fn state_change_data(enable: bool, property_atom: u32) -> [u32; 5] {
+    [if enable { 1 } else { 0 }, property_atom, 0, 1, 0]
+}
+
+#[cfg(target_os = "linux")]
+fn platform_set_always_on_top(
+    pointer: &GlobalPointer,
+    title: &str,
+    enable: bool,
+) -> Result<(), WindowError> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{
+        ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask,
+    };
+
+    let conn = pointer.conn.as_ref().ok_or(WindowError::Unsupported(
+        "no X11 connection for window level",
+    ))?;
+    let root = conn.setup().roots[0].root;
+
+    let intern = |name: &[u8]| -> Result<u32, WindowError> {
+        Ok(conn
+            .intern_atom(false, name)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .atom)
+    };
+    let name_atom = intern(b"_NET_WM_NAME")?;
+    let state_atom = intern(b"_NET_WM_STATE")?;
+    let above_atom = intern(b"_NET_WM_STATE_ABOVE")?;
+
+    // The overlay's client window is reparented under a WM frame (a child of root), so
+    // walk the tree from root, reading `_NET_WM_NAME` (type filter 0 = any type) to find
+    // our own windows. One walk per check is a few dozen local-X round trips — negligible
+    // against the overlay's 30 Hz repaint, and ClientMessages are only sent on mismatch.
+    let mut windows = Vec::new();
+    let mut queue = vec![root];
+    while let Some(w) = queue.pop() {
+        let children = conn
+            .query_tree(w)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .children;
+        for child in children {
+            let property = conn
+                .get_property(false, child, name_atom, 0u32, 0, 4096)
+                .map_err(|err| WindowError::X11(err.to_string()))?
+                .reply()
+                .map_err(|err| WindowError::X11(err.to_string()))?;
+            if !property.value.is_empty()
+                && String::from_utf8_lossy(&property.value).trim_end_matches('\0') == title
+            {
+                windows.push(child);
+                continue; // our client window: no need to descend further
+            }
+            queue.push(child);
+        }
+    }
+
+    let mut changed = false;
+    for w in windows {
+        let property = conn
+            .get_property(false, w, state_atom, 0u32, 0, 32)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?;
+        let already = property
+            .value32()
+            .is_some_and(|mut atoms| atoms.any(|atom| atom == above_atom));
+        if already == enable {
+            continue;
+        }
+        // `ClientMessageData` in x11rb 0.14 is a raw 20-byte payload; the EWMH data32
+        // words are little-endian on the wire (the X11 byte order x11rb uses).
+        let words = state_change_data(enable, above_atom);
+        let mut bytes = [0u8; 20];
+        for (slot, word) in words.iter().enumerate() {
+            bytes[slot * 4..slot * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let event = ClientMessageEvent::new(32, w, state_atom, ClientMessageData::from(bytes));
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .map_err(|err| WindowError::X11(err.to_string()))?
+        .ignore_error();
+        changed = true;
+    }
+    if changed {
+        conn.flush()
+            .map_err(|err| WindowError::X11(err.to_string()))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------
 // Windows implementation (M7): GetCursorPos + GetWindowRect + GetAsyncKeyState
 // ---------------------------------------------------------------------------------------
@@ -226,6 +341,19 @@ fn platform_shift_held(_pointer: &mut GlobalPointer) -> Result<bool, WindowError
     Ok(unsafe { GetAsyncKeyState(0x10) } & 0x8000 != 0)
 }
 
+#[cfg(target_os = "windows")]
+fn platform_set_always_on_top(
+    _pointer: &GlobalPointer,
+    _title: &str,
+    _enable: bool,
+) -> Result<(), WindowError> {
+    // eframe drops the builder hint on Windows too; SetWindowPos(HWND_TOPMOST) is M8
+    // Windows work (compile-gated, unverifiable here).
+    Err(WindowError::Unsupported(
+        "always-on-top is not enforced on Windows yet",
+    ))
+}
+
 // ---------------------------------------------------------------------------------------
 // Fallback for platforms without an implementation yet (Wayland, macOS)
 // ---------------------------------------------------------------------------------------
@@ -251,6 +379,17 @@ fn platform_shift_held(_pointer: &mut GlobalPointer) -> Result<bool, WindowError
     Ok(false)
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_set_always_on_top(
+    _pointer: &GlobalPointer,
+    _title: &str,
+    _enable: bool,
+) -> Result<(), WindowError> {
+    Err(WindowError::Unsupported(
+        "always-on-top is only enforced on X11 in this build",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +411,13 @@ mod tests {
         // must not panic for any 8-bit code.
         let keys = [0xFFu8; 32];
         assert!(key_bitmap_contains(&keys, u8::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net_wm_state_payload_adds_and_removes() {
+        // `[action, property, second_property, source=app, unused]` per EWMH.
+        assert_eq!(state_change_data(true, 42), [1, 42, 0, 1, 0]);
+        assert_eq!(state_change_data(false, 0xBAD), [0, 0xBAD, 0, 1, 0]);
     }
 }

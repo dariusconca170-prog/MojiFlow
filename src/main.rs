@@ -113,9 +113,16 @@ fn main() -> anyhow::Result<()> {
     };
 
     let viewport = egui::ViewportBuilder::default()
-        .with_title("MediaLingual")
+        .with_title(medialingual_native::platform::OVERLAY_TITLE)
         .with_transparent(true)
-        .with_always_on_top()
+        // Note: eframe 0.36 drops window-level hints entirely (no WindowLevel handling in
+        // its winit integration), so this is intent only — the real `_NET_WM_STATE_ABOVE`
+        // is asserted at runtime by `App` (see `GlobalPointer::set_always_on_top`).
+        .with_window_level(if config.window.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        })
         .with_decorations(config.window.show_decorations)
         .with_taskbar(false)
         // Start click-through; `App::apply_passthrough` re-enables input only while the

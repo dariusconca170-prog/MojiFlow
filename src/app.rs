@@ -237,6 +237,11 @@ pub struct App {
     /// Last hotkey action applied + when, shown in the dashboard header so key presses
     /// have visible feedback even while the overlay is click-through.
     pub last_action: Option<(Instant, &'static str)>,
+    /// Last time the EWMH always-on-top hint was re-asserted (eframe drops the builder
+    /// hint; we enforce `_NET_WM_STATE_ABOVE` ourselves at a low cadence).
+    last_topmost_check: Instant,
+    /// Only surface the always-on-top unsupported error once (e.g. macOS).
+    topmost_error_logged: bool,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -391,6 +396,8 @@ impl App {
             status_log: VecDeque::new(),
             dashboard_tokens: None,
             last_action: None,
+            last_topmost_check: Instant::now(),
+            topmost_error_logged: false,
         }
     }
 
@@ -1045,6 +1052,24 @@ impl eframe::App for App {
         // user closes it or toggles it off), so the state lives in `config.window`.
         if self.config.window.dashboard_open {
             crate::gui::dashboard::show(self, ui.ctx());
+        }
+
+        // eframe 0.36 ignores `ViewportBuilder::with_window_level`, so re-assert the EWMH
+        // `_NET_WM_STATE_ABOVE` at a low cadence (self-heals if the WM drops it). Cheap:
+        // one X tree walk per check; a ClientMessage is only sent when the state differs.
+        if self.last_topmost_check.elapsed() >= Duration::from_millis(750) {
+            self.last_topmost_check = Instant::now();
+            if let Err(err) = self.pointer.set_always_on_top(
+                crate::platform::OVERLAY_TITLE,
+                self.config.window.always_on_top,
+            ) {
+                if !self.topmost_error_logged {
+                    self.topmost_error_logged = true;
+                    tracing::warn!(error = %err, "always-on-top enforcement unavailable");
+                    self.toasts
+                        .push(format!("always-on-top unavailable: {err}"), true);
+                }
+            }
         }
 
         // Enable/disable click-through from the interactive regions the overlay just
