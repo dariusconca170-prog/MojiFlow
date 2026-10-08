@@ -1,0 +1,19 @@
+WEBVTT - test file
+
+NOTE
+This is a comment block that must be ignored.
+It spans multiple lines.
+
+cue-1
+00:01.000 --> 00:04.000 align:start position:10%
+short form timestamp
+
+00:00:05.000 --> 00:00:07.500
+styled <c.yellow>text</c> kept readable
+
+::cue {
+  color: yellow;
+}
+
+00:00:06.500 --> 00:00:07.500
+overlap candidate

@@ -106,8 +106,8 @@ pub enum SubtitleError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClockError {
-    #[error("clock source {source} unavailable: {reason}")]
-    Unavailable { source: String, reason: String },
+    #[error("clock source {component} unavailable: {reason}")]
+    Unavailable { component: String, reason: String },
     #[error("mpv IPC socket {path} not found; start mpv with --input-ipc-server={path}")]
     MpvSocketMissing { path: PathBuf },
     #[error("mpv IPC I/O: {0}")]
@@ -199,6 +199,8 @@ pub enum WindowError {
     X11(String),
     #[error("Win32 call failed: {0}")]
     Win32(String),
-    #[error("global cursor query unavailable on this session type ({0}); using manual-region fallback")]
+    #[error(
+        "global cursor query unavailable on this session type ({0}); using manual-region fallback"
+    )]
     CursorQueryUnavailable(&'static str),
 }

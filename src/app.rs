@@ -1,38 +1,83 @@
 //! Application state machine and the UI ↔ worker message bus.
 //!
 //! `UiCommand` flows UI → workers, `CoreEvent` flows workers → UI through bounded channels.
-//! Workers hold `egui::Context` handles and call `request_repaint()` when they post an event.
+//! Workers hold a [`RepaintHandle`] and signal it after posting an event so the UI wakes
+//! up exactly when there is something new (never busy-polling).
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clock::{self, manual::ManualClock, PlaybackClock};
 use crate::config::Config;
 use crate::error::MlError;
+use crate::subs::SubtitleTrack;
 
 /// Commands sent from the UI thread to worker threads/tasks.
 #[derive(Debug)]
 pub enum UiCommand {
     /// Load a subtitle track from a path (drag-and-drop or file dialog).
     LoadSubtitles(std::path::PathBuf),
-    /// Set the playback clock source at runtime.
-    SetClockSource(crate::config::ClockSource),
-    /// Adjust the user subtitle offset by `delta_ms`.
-    AdjustOffset { delta_ms: i64 },
-    /// Export the active cue as an Anki note (audio/image capture included).
-    ExportCard,
-    /// Stop every worker and release resources.
+    /// Stop the worker and release resources.
     Shutdown,
 }
 
 /// Events posted by workers to the UI thread.
 #[derive(Debug)]
 pub enum CoreEvent {
+    /// A subtitle track finished loading (or failed with a typed error).
+    TrackLoaded(Result<SubtitleTrack, MlError>),
     /// A subsystem reported a human-readable status change (status strip).
-    Status { component: &'static str, text: String },
+    Status {
+        component: &'static str,
+        text: String,
+    },
     /// A non-fatal error to surface as a toast.
     Warning(MlError),
     /// A fatal-but-recoverable error; the app keeps running, the worker stopped.
-    WorkerFailed { worker: &'static str, error: MlError },
+    WorkerFailed {
+        worker: &'static str,
+        error: MlError,
+    },
+}
+
+/// Worker-side handle onto the renderer: lets background threads wake the UI without
+/// owning the full `egui::Context` API surface.
+pub struct RepaintHandle {
+    ctx: egui::Context,
+}
+
+impl RepaintHandle {
+    pub fn new(ctx: egui::Context) -> Self {
+        Self { ctx }
+    }
+
+    /// Standalone context for worker tests that must run without a window.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self {
+            ctx: egui::Context::default(),
+        }
+    }
+
+    /// Wake the UI immediately.
+    pub fn request(&self) {
+        self.ctx.request_repaint();
+    }
+
+    /// Wake the UI at most after `delay` — used to throttle high-frequency sources
+    /// (mpv time-pos) so idle CPU stays low.
+    pub fn request_after(&self, delay: Duration) {
+        self.ctx.request_repaint_after(delay);
+    }
+}
+
+impl Clone for RepaintHandle {
+    fn clone(&self) -> Self {
+        Self {
+            ctx: self.ctx.clone(),
+        }
+    }
 }
 
 /// Auto-hiding toast shown in a corner of the overlay.
@@ -72,9 +117,26 @@ impl ToastQueue {
     pub fn iter(&self) -> impl Iterator<Item = &Toast> {
         self.items.iter()
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+/// Bounded event channel wiring handed to every worker.
+#[derive(Clone)]
+pub struct EventBus {
+    tx: crossbeam_channel::Sender<CoreEvent>,
+    repaint: Arc<RepaintHandle>,
+}
+
+impl EventBus {
+    pub fn new(tx: crossbeam_channel::Sender<CoreEvent>, repaint: Arc<RepaintHandle>) -> Self {
+        Self { tx, repaint }
+    }
+
+    /// Post an event and wake the UI. Never blocks when the channel is full — a dropped
+    /// event is preferable to stalling a worker.
+    pub fn post(&self, event: CoreEvent) {
+        if self.tx.send(event).is_ok() {
+            self.repaint.request();
+        }
     }
 }
 
@@ -88,8 +150,23 @@ pub struct App {
     pub toasts: ToastQueue,
     /// Whether the CJK font loaded from the system or the embedded fallback.
     pub font_source: crate::gui::fonts::FontSource,
-    /// Milestone-1 demo content until subtitle tracks land in M2.
+    /// Milestone-1 demo content, shown until a track is loaded and a cue is active.
     pub demo_text: String,
+
+    // --- M2: subtitles + clocks ---
+    pub track: Option<SubtitleTrack>,
+    /// Index of the currently active cue (into `track`).
+    pub active_cue: Option<usize>,
+    /// User fine offset in ms (`[`/`]`), layered on top of the clock.
+    pub user_offset_ms: i64,
+    clock: Box<dyn PlaybackClock>,
+    /// Control handle for the manual clock (shares state with `clock` when manual).
+    pub manual: ManualClock,
+    events_rx: crossbeam_channel::Receiver<CoreEvent>,
+    loader_tx: crossbeam_channel::Sender<UiCommand>,
+    /// Workers that must be joined/stopped at exit.
+    shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    last_sync_state: Option<crate::clock::SyncState>,
 }
 
 impl App {
@@ -98,15 +175,67 @@ impl App {
         config_path: Option<std::path::PathBuf>,
         config_issues: Vec<MlError>,
         font_source: crate::gui::fonts::FontSource,
+        ctx: egui::Context,
     ) -> Self {
+        let (events_tx, events_rx) = crossbeam_channel::bounded::<CoreEvent>(64);
+        let repaint = Arc::new(RepaintHandle::new(ctx.clone()));
+        let bus = EventBus::new(events_tx.clone(), Arc::clone(&repaint));
+
+        // Subtitle loader: a dedicated thread doing file I/O + parsing off the UI thread.
+        let (loader_tx, loader_rx) = crossbeam_channel::bounded::<UiCommand>(8);
+        let loader_bus = bus.clone();
+        let loader_thread = std::thread::Builder::new()
+            .name("subtitle-loader".to_owned())
+            .spawn(move || {
+                while let Ok(cmd) = loader_rx.recv() {
+                    match cmd {
+                        UiCommand::LoadSubtitles(path) => {
+                            let result = crate::subs::load_path(&path).map_err(MlError::from);
+                            loader_bus.post(CoreEvent::TrackLoaded(result));
+                        }
+                        UiCommand::Shutdown => break,
+                    }
+                }
+            })
+            .expect("spawn subtitle loader thread");
+        let loader_join = Arc::new(std::sync::Mutex::new(Some(loader_thread)));
+
+        let manual = ManualClock::new();
+        let (clock, clock_fallback) = clock::build_clock(
+            &config.clock,
+            manual.clone(),
+            events_tx,
+            Arc::clone(&repaint),
+        );
+
+        let mut issues = config_issues;
+        if let Some(err) = clock_fallback {
+            issues.push(MlError::Clock(err));
+        }
+
         Self {
+            user_offset_ms: config.subtitle.user_offset_ms,
             config,
             config_path,
-            config_issues,
+            config_issues: issues,
             toasts: ToastQueue::default(),
             font_source,
             demo_text: "日本語の文をマイニングしよう。漢字・かな・々・ー・〜 すべて表示されます。"
                 .to_owned(),
+            track: None,
+            active_cue: None,
+            clock,
+            manual,
+            events_rx,
+            loader_tx,
+            shutdown_hooks: vec![Box::new(move || {
+                if let Ok(mut guard) = loader_join.lock() {
+                    if let Some(handle) = guard.take() {
+                        let _ = handle.join();
+                    }
+                }
+            })],
+            last_sync_state: None,
         }
     }
 
@@ -117,7 +246,169 @@ impl App {
         }
     }
 
-    pub fn now(&self) -> Instant {
-        Instant::now()
+    /// Drain worker events without blocking. Called every frame.
+    pub fn poll_events(&mut self) {
+        loop {
+            match self.events_rx.try_recv() {
+                Ok(CoreEvent::TrackLoaded(result)) => match result {
+                    Ok(track) => {
+                        self.toasts.push(
+                            format!(
+                                "loaded {} — {} cues ({}, {} skipped)",
+                                track
+                                    .path()
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                track.len(),
+                                track.format().label(),
+                                track.encoding(),
+                            ),
+                            false,
+                        );
+                        self.track = Some(track);
+                        self.active_cue = None;
+                    }
+                    Err(err) => {
+                        self.toasts.push(err.to_string(), true);
+                        self.track = None;
+                        self.active_cue = None;
+                    }
+                },
+                Ok(CoreEvent::Status { component, text }) => {
+                    tracing::info!(component, text = %text, "status");
+                }
+                Ok(CoreEvent::Warning(err)) => {
+                    self.toasts.push(err.to_string(), true);
+                }
+                Ok(CoreEvent::WorkerFailed { worker, error }) => {
+                    self.toasts.push(format!("{worker} stopped: {error}"), true);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// The text currently shown: active cue if any, otherwise the demo string.
+    pub fn subtitle_text(&self) -> String {
+        match (&self.track, self.active_cue) {
+            (Some(track), Some(idx)) => track.cue(idx).map(|c| c.text.clone()).unwrap_or_default(),
+            (Some(_), None) => String::new(), // gap between cues
+            (None, _) => self.demo_text.clone(),
+        }
+    }
+
+    pub fn subtitle_offset_ms(&self) -> i64 {
+        self.user_offset_ms
+    }
+
+    /// Advance timing for this frame: pick the active cue from `clock + offset`.
+    pub fn update_timing(&mut self) {
+        let effective = clock::effective_time(self.clock.as_ref(), self.user_offset_ms);
+        self.active_cue = match &self.track {
+            Some(track) => track.active_at(effective),
+            None => None,
+        };
+    }
+
+    /// Handle local (overlay-focused) keys for M2: `[`/`]` offset, `Space`
+    /// play/pause, arrows seek — the global variants arrive in M7 via `global-hotkey`.
+    pub fn handle_local_keys(&mut self, ui: &egui::Ui) {
+        let step = self.config.subtitle.offset_step_ms;
+        let actions = ui.input(|i| {
+            if !i.focused {
+                return None;
+            }
+            Some((
+                i.key_pressed(egui::Key::OpenBracket),
+                i.key_pressed(egui::Key::CloseBracket),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Space),
+            ))
+        });
+        let Some((back, fwd, seek_back, seek_fwd, toggle)) = actions else {
+            return;
+        };
+        if back {
+            self.adjust_offset(-step);
+        }
+        if fwd {
+            self.adjust_offset(step);
+        }
+        if toggle {
+            self.manual.toggle_play_pause();
+        }
+        if seek_back {
+            self.manual.seek_by(Duration::from_secs(5), false);
+        }
+        if seek_fwd {
+            self.manual.seek_by(Duration::from_secs(5), true);
+        }
+    }
+
+    /// Adjust the fine offset by `delta_ms` and show a toast.
+    pub fn adjust_offset(&mut self, delta_ms: i64) {
+        self.user_offset_ms = self.user_offset_ms.saturating_add(delta_ms);
+        self.config.subtitle.user_offset_ms = self.user_offset_ms;
+        self.toasts
+            .push(format!("offset {:+} ms", self.user_offset_ms), false);
+    }
+
+    /// Ask every worker to stop and join it. Safe to call more than once.
+    pub fn shutdown_workers(&mut self) {
+        let _ = self.loader_tx.send(UiCommand::Shutdown);
+        self.clock.shutdown();
+        for hook in std::mem::take(&mut self.shutdown_hooks) {
+            hook();
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_config_issues();
+        self.poll_events();
+
+        // Accept subtitle files dropped onto the overlay.
+        let dropped = ui.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            let path = file.path();
+            if !path.as_os_str().is_empty() {
+                let _ = self
+                    .loader_tx
+                    .send(UiCommand::LoadSubtitles(path.to_path_buf()));
+            }
+        }
+
+        self.handle_local_keys(ui);
+        self.update_timing();
+
+        // Surface clock sync-state transitions as toasts (e.g. mpv connected/lost).
+        let sync = self.clock.sync_state();
+        if self.last_sync_state.as_ref() != Some(&sync) {
+            if let crate::clock::SyncState::Stale(reason) = &sync {
+                self.toasts.push(reason.clone(), true);
+            }
+            self.last_sync_state = Some(sync);
+        }
+
+        crate::gui::overlay::show(self, ui);
+
+        // While the clock is running, keep a slow tick so the active cue advances;
+        // when paused/disconnected egui idles with no repaints at all.
+        if self.clock.is_playing() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// Fully transparent clear color — the whole point of the overlay window.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown_workers();
     }
 }

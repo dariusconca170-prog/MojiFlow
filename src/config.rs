@@ -358,13 +358,13 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| ConfigError::Write {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
         }
-        let text = toml::to_string_pretty(self).map_err(|err| ConfigError::Invalid(err.to_string()))?;
+        let text =
+            toml::to_string_pretty(self).map_err(|err| ConfigError::Invalid(err.to_string()))?;
         std::fs::write(path, text).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
@@ -398,8 +398,9 @@ pub fn validate_field_template(template: &str) -> std::result::Result<(), String
     let mut rest = template;
     while let Some(start) = rest.find('{') {
         let after = &rest[start + 1..];
-        if after.starts_with('{') {
-            rest = &after[1..];
+        if let Some(escaped) = after.strip_prefix('{') {
+            // `{{` is an escaped literal brace.
+            rest = escaped;
             continue;
         }
         match after.find('}') {

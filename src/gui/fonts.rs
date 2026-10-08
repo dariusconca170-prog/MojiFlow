@@ -18,6 +18,10 @@ use crate::error::FontError;
 pub enum FontSource {
     System(PathBuf),
     Embedded,
+    /// Every probe failed; egui falls back to its built-in fonts (ASCII only) and the UI
+    /// reports this error as a toast. The app still runs — Japanese shows as tofu until
+    /// the user installs a CJK font.
+    Failed(String),
 }
 
 impl std::fmt::Display for FontSource {
@@ -25,6 +29,7 @@ impl std::fmt::Display for FontSource {
         match self {
             FontSource::System(path) => write!(f, "system: {}", path.display()),
             FontSource::Embedded => write!(f, "embedded assets/fonts/NotoSansCJK-Regular.ttc"),
+            FontSource::Failed(reason) => write!(f, "FAILED ({reason})"),
         }
     }
 }
@@ -106,8 +111,7 @@ pub fn install_cjk_fonts(ctx: &egui::Context) -> Result<FontSource, FontError> {
 
     // System probe failed: embedded fallback (OFL-licensed Noto Sans CJK JP).
     probed += 1;
-    let index = face_index_for_japanese(EMBEDDED_FONT)
-        .ok_or(FontError::NoCjkFont { probed })?;
+    let index = face_index_for_japanese(EMBEDDED_FONT).ok_or(FontError::NoCjkFont { probed })?;
     apply_font(ctx, std::borrow::Cow::Borrowed(EMBEDDED_FONT), index);
     Ok(FontSource::Embedded)
 }
@@ -119,7 +123,11 @@ fn apply_font(ctx: &egui::Context, font: std::borrow::Cow<'static, [u8]>, index:
     let mut definitions = FontDefinitions::default();
     definitions.font_data.insert(
         "cjk-jp".to_owned(),
-        std::sync::Arc::new(egui::FontData { font, index, ..Default::default() }),
+        std::sync::Arc::new(egui::FontData {
+            font,
+            index,
+            tweak: egui::FontTweak::default(),
+        }),
     );
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         if let Some(list) = definitions.families.get_mut(&family) {
@@ -270,12 +278,10 @@ mod tests {
 
     fn read_ttc_offset(bytes: &[u8], i: usize) -> Option<usize> {
         let pos = 12 + i * 4;
-        Some(u32::from_be_bytes([
-            bytes[pos],
-            bytes[pos + 1],
-            bytes[pos + 2],
-            bytes[pos + 3],
-        ]) as usize)
+        Some(
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize,
+        )
     }
 
     /// Glyph coverage for every script character in `DEMO_TEXT` (kanji, kana, 々ー〜).
@@ -284,10 +290,9 @@ mod tests {
         use ttf_parser::Face;
         let index = face_index_for_japanese(EMBEDDED_FONT).expect("face index");
         let face = Face::parse(EMBEDDED_FONT, index).expect("parse embedded font");
-        let cmap = face.tables().cmap.expect("cmap table");
         let mut missing = Vec::new();
         for ch in DEMO_TEXT.chars().filter(|c| !c.is_whitespace()) {
-            if cmap.glyph_index(ch).is_none() {
+            if face.glyph_index(ch).is_none() {
                 missing.push(ch);
             }
         }
@@ -301,20 +306,36 @@ mod tests {
     fn egui_layouts_demo_text_with_cjk_font() {
         let ctx = egui::Context::default();
         let source = install_cjk_fonts(&ctx).expect("font install");
-        assert_eq!(source, FontSource::Embedded);
+        // On a system with a Japanese font installed the system path wins; the embedded
+        // fallback is exercised by `embedded_font_covers_all_demo_codepoints` either way.
+        assert!(
+            matches!(source, FontSource::System(_) | FontSource::Embedded),
+            "unexpected source: {source:?}"
+        );
 
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            ctx.fonts_mut(|fonts| {
-                let galley = fonts.layout_no_wrap(
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // Layout alone produces no paint shapes — paint the galley too, so the frame
+            // output proves the text was shaped AND turned into real primitives.
+            let galley = ui.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(
                     DEMO_TEXT.to_owned(),
                     egui::FontId::proportional(32.0),
                     egui::Color32::WHITE,
-                );
-                assert!(!galley.rows.is_empty(), "no rows laid out");
-                assert!(galley.rect.width() > 100.0, "width {}", galley.rect.width());
-                assert!(galley.rect.height() >= 32.0, "height {}", galley.rect.height());
+                )
             });
+            assert!(!galley.rows.is_empty(), "no rows laid out");
+            assert!(galley.rect.width() > 100.0, "width {}", galley.rect.width());
+            assert!(
+                galley.rect.height() >= 32.0,
+                "height {}",
+                galley.rect.height()
+            );
+            ui.painter()
+                .galley(egui::Pos2::ZERO, galley, egui::Color32::WHITE);
         });
         assert!(!output.shapes.is_empty(), "no shapes produced");
+        // In a real run eframe applies TexturesDelta (font atlas upload); the test has no
+        // renderer, so clear it — epaint panics if unapplied deltas are silently dropped.
+        output.textures_delta.clear();
     }
 }

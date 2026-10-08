@@ -74,6 +74,7 @@ windows-sys = { version = "0.61", features = [
 wiremock = "0.6"
 tempfile = "3"
 insta = "1"
+ttf-parser = "0.25.1"
 
 [[bin]]
 name = "medialingual-native"
