@@ -4,6 +4,7 @@
 //! else lives here so integration tests in `tests/` can link against it.
 
 pub mod app;
+pub mod audio;
 pub mod capture;
 pub mod clock;
 pub mod config;

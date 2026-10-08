@@ -8,4 +8,5 @@
 //! — that is what [`window::GlobalPointer`] wraps (X11 `QueryPointer`/`QueryKeymap` on
 //! Linux; see that module for the per-platform fallbacks).
 
+pub mod screen;
 pub mod window;

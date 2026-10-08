@@ -153,6 +153,8 @@ pub enum CaptureError {
 pub enum AudioError {
     #[error("no audio output device available for loopback capture")]
     NoDevice,
+    #[error("audio input unavailable: {0}")]
+    InputUnavailable(String),
     #[error("selected audio device '{0}' disappeared; reconnecting")]
     DeviceLost(String),
     #[error("audio stream error: {0}")]
