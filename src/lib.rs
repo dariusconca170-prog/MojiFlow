@@ -3,6 +3,7 @@
 //! `main.rs` is a thin binary wrapper (logging, config load, eframe launch); everything
 //! else lives here so integration tests in `tests/` can link against it.
 
+pub mod anki;
 pub mod app;
 pub mod audio;
 pub mod capture;
