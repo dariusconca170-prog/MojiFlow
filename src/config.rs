@@ -34,6 +34,8 @@ pub struct WindowConfig {
     pub show_decorations: bool,
     /// Semi-transparent backing box behind subtitle text.
     pub backing_box: bool,
+    /// Whether the control-room dashboard window is open (hotkey Ctrl+Alt+D).
+    pub dashboard_open: bool,
 }
 
 impl Default for WindowConfig {
@@ -43,6 +45,7 @@ impl Default for WindowConfig {
             always_on_top: true,
             show_decorations: false,
             backing_box: true,
+            dashboard_open: true,
         }
     }
 }
@@ -129,6 +132,8 @@ pub struct HotkeysConfig {
     pub clock_seek_forward: String,
     pub toggle_edit_mode: String,
     pub toggle_status: String,
+    /// Open/close the control-room dashboard window.
+    pub toggle_dashboard: String,
     /// Bare keys accepted only while the overlay is focused or its popover is hovered.
     pub local_export: String,
     pub local_offset_back: String,
@@ -149,6 +154,7 @@ impl Default for HotkeysConfig {
             clock_seek_forward: "Ctrl+Alt+ArrowRight".to_owned(),
             toggle_edit_mode: "Ctrl+Alt+E".to_owned(),
             toggle_status: "Ctrl+Alt+P".to_owned(),
+            toggle_dashboard: "Ctrl+Alt+D".to_owned(),
             local_export: "S".to_owned(),
             local_offset_back: "[".to_owned(),
             local_offset_forward: "]".to_owned(),

@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::dict::Dictionary;
 use crate::error::MlError;
 use crate::export::{mine_card, ExportSource, ExportWorker};
+use crate::gui::dashboard::TokenRow;
 use crate::gui::popover::PopoverData;
 use crate::hotkey::{AppAction, GlobalHotkeys};
 use crate::subs::SubtitleTrack;
@@ -166,7 +167,8 @@ pub struct App {
     pub active_cue: Option<usize>,
     /// User fine offset in ms (`[`/`]`), layered on top of the clock.
     pub user_offset_ms: i64,
-    clock: Box<dyn PlaybackClock>,
+    /// Current media-time source (manual / mpv / mpris). Workers never touch it.
+    pub clock: Box<dyn PlaybackClock>,
     /// Control handle for the manual clock (shares state with `clock` when manual).
     pub manual: ManualClock,
     events_rx: crossbeam_channel::Receiver<CoreEvent>,
@@ -223,8 +225,18 @@ pub struct App {
     /// Edit mode toggle (editing UI arrives with the M8 settings panel; state is shown
     /// in the status strip so the toggle is never a silent no-op).
     pub edit_mode: bool,
-    /// Whether the status strip is drawn (hotkey Ctrl+Alt+E).
+    /// Whether the status strip is drawn (hotkey Ctrl+Alt+P).
     pub show_status: bool,
+
+    // --- M7 dashboard (control room) ---
+    /// Last few worker `Status` lines (export results, sync notes) for the dashboard log.
+    pub status_log: VecDeque<String>,
+    /// Per-token dictionary resolution for the active cue, recomputed only when the cue
+    /// text changes (the dashboard shows the "did we resolve it" state per word).
+    pub dashboard_tokens: Option<(String, Vec<TokenRow>)>,
+    /// Last hotkey action applied + when, shown in the dashboard header so key presses
+    /// have visible feedback even while the overlay is click-through.
+    pub last_action: Option<(Instant, &'static str)>,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -376,6 +388,9 @@ impl App {
             visible: true,
             edit_mode: false,
             show_status: true,
+            status_log: VecDeque::new(),
+            dashboard_tokens: None,
+            last_action: None,
         }
     }
 
@@ -417,6 +432,10 @@ impl App {
                 },
                 Ok(CoreEvent::Status { component, text }) => {
                     tracing::info!(component, text = %text, "status");
+                    self.status_log.push_back(text.clone());
+                    while self.status_log.len() > 6 {
+                        self.status_log.pop_front();
+                    }
                 }
                 Ok(CoreEvent::Warning(err)) => {
                     self.toasts.push(err.to_string(), true);
@@ -710,6 +729,7 @@ impl App {
     }
 
     fn apply_action(&mut self, action: AppAction) {
+        self.last_action = Some((Instant::now(), action.label()));
         match action {
             AppAction::ExportCard => {
                 self.export_current_card();
@@ -769,7 +789,74 @@ impl App {
                     false,
                 );
             }
+            AppAction::ToggleDashboard => {
+                self.config.window.dashboard_open = !self.config.window.dashboard_open;
+                self.toasts.push(
+                    format!(
+                        "dashboard {}",
+                        if self.config.window.dashboard_open {
+                            "opened"
+                        } else {
+                            "closed"
+                        }
+                    ),
+                    false,
+                );
+            }
         }
+    }
+
+    /// Recompute the per-token dictionary rows for the dashboard when the active cue text
+    /// changed (LRU-cached lookups; runs only while the dashboard is open).
+    pub fn refresh_dashboard_tokens(&mut self) {
+        let text = match self
+            .active_cue
+            .and_then(|index| self.track.as_ref().and_then(|track| track.cue(index)))
+        {
+            Some(cue) => cue.text.clone(),
+            None => String::new(),
+        };
+        if self
+            .dashboard_tokens
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == text)
+        {
+            return;
+        }
+        let tokens = self.tokens_cached(&text);
+        let mut rows = Vec::with_capacity(tokens.len());
+        for token in tokens.iter() {
+            let (resolved, reading) = if token.is_content_word() {
+                match &mut self.dictionary {
+                    Some(dictionary) => match dictionary.resolve_detailed(&token.surface) {
+                        Ok(Some(resolution)) => {
+                            let reading = resolution
+                                .entries
+                                .first()
+                                .map(|entry| entry.reading.clone())
+                                .unwrap_or_else(|| token.reading.clone());
+                            (true, reading)
+                        }
+                        // Unresolved content word: dictionary miss is displayed honestly.
+                        Ok(None) => (false, token.reading.clone()),
+                        Err(err) => {
+                            tracing::debug!(error = %err, surface = %token.surface, "dictionary miss in dashboard");
+                            (false, token.reading.clone())
+                        }
+                    },
+                    None => (false, token.reading.clone()),
+                }
+            } else {
+                (false, token.reading.clone())
+            };
+            rows.push(TokenRow {
+                surface: token.surface.clone(),
+                reading,
+                content: token.is_content_word(),
+                resolved,
+            });
+        }
+        self.dashboard_tokens = Some((text, rows));
     }
 
     /// File dialog for a subtitle file. Linux uses the XDG desktop portal (`rfd` with the
@@ -952,6 +1039,13 @@ impl eframe::App for App {
         }
 
         crate::gui::overlay::show(self, ui);
+
+        // Control-room dashboard: a normal opaque window beside the overlay. Immediate
+        // viewports open while we keep calling this and close when we stop (i.e. when the
+        // user closes it or toggles it off), so the state lives in `config.window`.
+        if self.config.window.dashboard_open {
+            crate::gui::dashboard::show(self, ui.ctx());
+        }
 
         // Enable/disable click-through from the interactive regions the overlay just
         // computed. Deferred viewport commands apply after this frame.

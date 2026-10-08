@@ -29,6 +29,27 @@ pub enum AppAction {
     ClockSeekForward,
     ToggleEditMode,
     ToggleStatus,
+    ToggleDashboard,
+}
+
+impl AppAction {
+    /// Human label for status/toast/dashboard text.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppAction::ExportCard => "export card",
+            AppAction::OffsetBack => "offset back",
+            AppAction::OffsetForward => "offset forward",
+            AppAction::ToggleLock => "toggle lock",
+            AppAction::ToggleVisibility => "toggle visibility",
+            AppAction::OpenSubtitle => "open subtitle",
+            AppAction::ClockStartPause => "clock start/pause",
+            AppAction::ClockSeekBack => "clock seek back",
+            AppAction::ClockSeekForward => "clock seek forward",
+            AppAction::ToggleEditMode => "toggle edit mode",
+            AppAction::ToggleStatus => "toggle status",
+            AppAction::ToggleDashboard => "toggle dashboard",
+        }
+    }
 }
 
 /// Registered global hotkeys: the manager plus the id → action mapping for events.
@@ -38,7 +59,7 @@ pub struct GlobalHotkeys {
 }
 
 /// All `(config spec, action)` pairs the app supports, in registration order.
-pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 11] {
+pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 12] {
     [
         (&config.export_card, AppAction::ExportCard),
         (&config.offset_back, AppAction::OffsetBack),
@@ -51,6 +72,7 @@ pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 11] {
         (&config.clock_seek_forward, AppAction::ClockSeekForward),
         (&config.toggle_edit_mode, AppAction::ToggleEditMode),
         (&config.toggle_status, AppAction::ToggleStatus),
+        (&config.toggle_dashboard, AppAction::ToggleDashboard),
     ]
 }
 
@@ -64,25 +86,9 @@ pub fn parse_hotkey(spec: &str, action: AppAction) -> Result<Option<HotKey>, Hot
         .map(Some)
         .map_err(|err| HotkeyError::Parse {
             spec: spec.to_owned(),
-            action: action_name(action).to_owned(),
+            action: action.label().to_owned(),
             reason: err.to_string(),
         })
-}
-
-fn action_name(action: AppAction) -> &'static str {
-    match action {
-        AppAction::ExportCard => "export card",
-        AppAction::OffsetBack => "offset back",
-        AppAction::OffsetForward => "offset forward",
-        AppAction::ToggleLock => "toggle lock",
-        AppAction::ToggleVisibility => "toggle visibility",
-        AppAction::OpenSubtitle => "open subtitle",
-        AppAction::ClockStartPause => "clock start/pause",
-        AppAction::ClockSeekBack => "clock seek back",
-        AppAction::ClockSeekForward => "clock seek forward",
-        AppAction::ToggleEditMode => "toggle edit mode",
-        AppAction::ToggleStatus => "toggle status",
-    }
 }
 
 impl GlobalHotkeys {
