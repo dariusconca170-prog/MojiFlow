@@ -1,5 +1,7 @@
 target/
 assets/dict/*.sqlite
+assets/dict/*.gz
+assets/dict/*.txt
 *.log
 
 # never commit key material

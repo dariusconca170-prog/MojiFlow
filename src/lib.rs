@@ -6,6 +6,9 @@
 pub mod app;
 pub mod clock;
 pub mod config;
+pub mod deinflect;
+pub mod dict;
 pub mod error;
 pub mod gui;
 pub mod subs;
+pub mod tokenize;

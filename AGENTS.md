@@ -5,6 +5,8 @@
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo fmt --manifest-path xtask/Cargo.toml --check
+cargo clippy --manifest-path xtask/Cargo.toml -- -D warnings
 cargo test
 cargo build
 cargo build --release
@@ -42,6 +44,16 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 ## Known platform caveats / limits
 
 (filled in as encountered)
+
+## Dictionary data (built by `cargo xtask build-dict`, gitignored artifacts)
+
+- Sources verified live on 2026-10-08 — re-verify before changing URLs:
+  - **JMdict_e** `http://ftp.edrdg.org/pub/Nihongo/JMdict_e.gz` (EDRDG; CC BY-SA-compatible terms) → `assets/dict/jmdict.sqlite` (~113 MB, 218k entries, one row per gloss × kanji-form × reading).
+  - **Kanjium** `github.com/mifunetoshiro/kanjium` (**CC BY-SA 4.0**, attribution required): `data/source_files/raw/accents.txt` → `pitch.sqlite` (124k rows), `raw/novels_freq.txt` → `frequency.sqlite` (286k words ranked by corpus count desc).
+- JMdict **Rev 1.09** quirks: `ent_seq` is a *child element* (older revisions used an attribute — both handled; a silent id=0 breaks entry grouping), and all POS values are DTD entities (`&n;`) which quick-xml emits as `Event::GeneralRef` (266 entities parsed from the DOCTYPE and resolved manually).
+- Entries group by `(entry id, primary form)` so distinct JMdict entries that share a surface (学生 'student' vs Heian-era senses) never merge, and alternate kanji forms stay separately displayable.
+- MeCab splits euphonic changes across tokens (読んで → 読ん + で): dictionary lookups must use `Token::base_form`, or `Dictionary::resolve()` for raw surfaces.
+- `assets/dict/` paths mirror `DictionaryConfig::default()` in `src/config.rs`; keep the two in sync when changing either.
 
 ## Manual QA checklist
 

@@ -1,0 +1,4 @@
+[alias]
+# Build-task helper: `cargo xtask <command>` runs the crate in `xtask/`.
+# Kept out of the main dependency tree so the app build stays lean.
+xtask = "run --manifest-path xtask/Cargo.toml --"
