@@ -3,12 +3,13 @@
 //! There is no universal media clock, so the source is selectable in `config.toml`:
 //! - [`manual::ManualClock`] — hotkey-driven start/pause/seek.
 //! - [`mpv_ipc::MpvIpcClock`] — frame-accurate sync over mpv's JSON IPC socket.
-//! - `MprisClock` (Linux) — lands in M7 via `zbus`.
+//! - [`mpris::MprisClock`] (Linux) — sync over the MPRIS v2.2 D-Bus interface.
 //! - `WhisperLiveClock` — lands in M8; cues are timestamped on arrival.
 //!
 //! Effective subtitle time is `clock.now() + user_offset`; the offset is applied by `App`.
 
 pub mod manual;
+pub mod mpris;
 pub mod mpv_ipc;
 
 use std::time::Duration;
@@ -56,13 +57,25 @@ pub fn build_clock(
             let clock = mpv_ipc::MpvIpcClock::spawn(config.mpv_socket.clone(), events, repaint);
             (Box::new(clock), None)
         }
-        ClockSource::Mpris => (
-            Box::new(manual),
-            Some(ClockError::Unavailable {
-                component: "mpris".to_owned(),
-                reason: "MPRIS clock arrives in milestone M7; using manual clock".to_owned(),
-            }),
-        ),
+        ClockSource::Mpris => {
+            #[cfg(target_os = "linux")]
+            {
+                let clock = mpris::MprisClock::spawn(config.mpris_player.clone(), events, repaint);
+                (Box::new(clock) as Box<dyn PlaybackClock>, None)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (config, events, repaint);
+                (
+                    Box::new(manual),
+                    Some(ClockError::Unavailable {
+                        component: "mpris".to_owned(),
+                        reason: "the MPRIS clock requires a Linux session bus; using manual clock"
+                            .to_owned(),
+                    }),
+                )
+            }
+        }
         ClockSource::WhisperLive => (
             Box::new(manual),
             Some(ClockError::Unavailable {

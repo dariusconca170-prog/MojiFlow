@@ -49,6 +49,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     app.drain_config_issues();
     app.toasts.expire(Instant::now());
 
+    // Hidden (Ctrl+Alt+H): draw nothing and drop hover/pin state so it never reappears
+    // stale; the window stays click-through so the video underneath is not blocked.
+    if !app.visible {
+        app.interactive_rects = Vec::new();
+        app.hover_token = None;
+        app.popover = None;
+        return;
+    }
+
     let area = ui.max_rect();
     let text = app.subtitle_text();
     let tokens = app.tokens_cached(&text);
@@ -94,7 +103,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     app.interactive_rects = interactive;
 
-    paint_status_strip(app, ui, area);
+    if app.show_status {
+        paint_status_strip(app, ui, area);
+    }
     paint_toasts(app, ui, area);
     handle_quit(ui);
 }

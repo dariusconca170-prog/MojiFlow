@@ -79,16 +79,14 @@ fn init_tracing(log_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn log_session_type() {
-    let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_owned());
-    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-    let x11 = std::env::var("DISPLAY").is_ok();
+    let session = medialingual_native::platform::detect();
     tracing::info!(
-        session = %session,
-        wayland,
-        x11,
+        session = %session.label(),
         os = std::env::consts::OS,
+        x11 = std::env::var("DISPLAY").is_ok(),
         "session detected"
     );
+    medialingual_native::platform::log_session(session);
 }
 
 fn main() -> anyhow::Result<()> {

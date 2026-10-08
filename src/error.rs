@@ -47,6 +47,12 @@ pub enum MlError {
     #[error("window tracking error: {0}")]
     Window(#[from] WindowError),
 
+    #[error("global hotkey error: {0}")]
+    Hotkey(#[from] HotkeyError),
+
+    #[error("export error: {0}")]
+    Export(#[from] ExportError),
+
     #[error("channel closed while sending {0}")]
     ChannelClosed(&'static str),
 
@@ -205,4 +211,26 @@ pub enum WindowError {
         "global cursor query unavailable on this session type ({0}); using manual-region fallback"
     )]
     CursorQueryUnavailable(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HotkeyError {
+    #[error("global hotkey manager init failed: {0}")]
+    Init(String),
+    #[error("cannot register global hotkey '{spec}': {reason}")]
+    Register { spec: String, reason: String },
+    #[error("invalid hotkey string '{spec}' for '{action}': {reason}")]
+    Parse {
+        spec: String,
+        action: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error("export worker stopped: {0}")]
+    Worker(String),
+    #[error("offline queue error: {0}")]
+    Queue(String),
 }

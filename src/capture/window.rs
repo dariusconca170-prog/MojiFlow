@@ -167,26 +167,86 @@ fn x11_window_id(window: RawWindowHandle) -> Result<u32, WindowError> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fallback for platforms without an implementation yet (Wayland, macOS, Windows-in-M4)
+// Windows implementation (M7): GetCursorPos + GetWindowRect + GetAsyncKeyState
 // ---------------------------------------------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn platform_new() -> GlobalPointer {
     GlobalPointer {}
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn platform_cursor(
+    _pointer: &mut GlobalPointer,
+    window: RawWindowHandle,
+    pixels_per_point: f32,
+) -> Result<Pos2, WindowError> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+
+    let mut point = POINT { x: 0, y: 0 };
+    // SAFETY: `point` is a writable out-parameter.
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return Err(WindowError::Win32("GetCursorPos failed".to_owned()));
+    }
+    let hwnd = match window {
+        RawWindowHandle::Win32(handle) => handle.hwnd.as_ptr(),
+        _ => {
+            return Err(WindowError::CursorQueryUnavailable(
+                "no Win32 window handle",
+            ))
+        }
+    };
+    let mut rect = windows_sys::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: `rect` is a writable out-parameter, `hwnd` came from the live window.
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return Err(WindowError::Win32("GetWindowRect failed".to_owned()));
+    }
+    let scale = if pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    Ok(Pos2::new(
+        f32::from(point.x - rect.left) / scale,
+        f32::from(point.y - rect.top) / scale,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_shift_held(_pointer: &mut GlobalPointer) -> Result<bool, WindowError> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    // VK_SHIFT (0x10); bit 15 set = key is down.
+    // SAFETY: GetAsyncKeyState takes only an int vKey.
+    Ok(unsafe { GetAsyncKeyState(0x10) } & 0x8000 != 0)
+}
+
+// ---------------------------------------------------------------------------------------
+// Fallback for platforms without an implementation yet (Wayland, macOS)
+// ---------------------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_new() -> GlobalPointer {
+    GlobalPointer {}
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn platform_cursor(
     _pointer: &mut GlobalPointer,
     _window: RawWindowHandle,
     _pixels_per_point: f32,
 ) -> Result<Pos2, WindowError> {
     Err(WindowError::CursorQueryUnavailable(
-        "global cursor query is only implemented for X11 in this build",
+        "global cursor query is only implemented for X11 and Windows in this build",
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn platform_shift_held(_pointer: &mut GlobalPointer) -> Result<bool, WindowError> {
     Ok(false)
 }

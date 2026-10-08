@@ -14,7 +14,9 @@ use crate::clock::{self, manual::ManualClock, PlaybackClock};
 use crate::config::Config;
 use crate::dict::Dictionary;
 use crate::error::MlError;
+use crate::export::{mine_card, ExportSource, ExportWorker};
 use crate::gui::popover::PopoverData;
+use crate::hotkey::{AppAction, GlobalHotkeys};
 use crate::subs::SubtitleTrack;
 use crate::tokenize::{JapaneseTokenizer, Token};
 
@@ -206,6 +208,23 @@ pub struct App {
     audio_active_key: Option<String>,
     /// Last seen retry error, surfaced as a toast once per change.
     audio_last_error: Option<String>,
+
+    // --- M7: global hotkeys + mining export ---
+    /// Registered global hotkeys; `None` when manager init failed (local keys remain).
+    hotkeys: Option<GlobalHotkeys>,
+    /// Background exporter (own tokio runtime): media + Anki + offline queue.
+    export_worker: Option<ExportWorker>,
+    /// Offline queue directory (config dir + `/queue`).
+    queue_dir: std::path::PathBuf,
+    /// Lock: forces the overlay interactive everywhere (move/click) until unlocked.
+    pub locked: bool,
+    /// Visibility: `false` hides the whole overlay (hotkey Ctrl+Alt+H).
+    pub visible: bool,
+    /// Edit mode toggle (editing UI arrives with the M8 settings panel; state is shown
+    /// in the status strip so the toggle is never a silent no-op).
+    pub edit_mode: bool,
+    /// Whether the status strip is drawn (hotkey Ctrl+Alt+E).
+    pub show_status: bool,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -227,6 +246,8 @@ impl App {
         let (events_tx, events_rx) = crossbeam_channel::bounded::<CoreEvent>(64);
         let repaint = Arc::new(RepaintHandle::new(ctx.clone()));
         let bus = EventBus::new(events_tx.clone(), Arc::clone(&repaint));
+        // Clone now: `build_clock` moves `events_tx`, but the export worker (M7) needs it.
+        let export_events = events_tx.clone();
 
         // Subtitle loader: a dedicated thread doing file I/O + parsing off the UI thread.
         let (loader_tx, loader_rx) = crossbeam_channel::bounded::<UiCommand>(8);
@@ -281,6 +302,35 @@ impl App {
         // thread; retries and surfaces via `update_audio_state`.
         let audio = AudioCapture::start(&config.audio);
 
+        // M7: global hotkeys. On native Wayland (or when the X manager fails) registration
+        // errors surface once as a toast and the local keys stay as the fallback — a
+        // graceful degradation, documented in AGENTS.md.
+        let hotkeys = match GlobalHotkeys::new(&config.hotkeys) {
+            Ok(hotkeys) => {
+                tracing::info!(
+                    count = hotkeys.registered_count(),
+                    "global hotkeys registered"
+                );
+                Some(hotkeys)
+            }
+            Err(err) => {
+                issues.push(MlError::Hotkey(err));
+                None
+            }
+        };
+
+        // M7: mining export — one worker thread with its own tokio runtime so the Anki
+        // round trip (and media encoding) never touches the UI thread.
+        let export_worker = ExportWorker::spawn(export_events, Arc::clone(&repaint));
+
+        // Offline queue lives next to the config file; temp dir is the fallback when the
+        // config path is unknown (e.g. default config without a persisted location).
+        let queue_dir = config_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.join("queue"))
+            .unwrap_or_else(|| std::env::temp_dir().join("medialingual-queue"));
+
         Self {
             user_offset_ms: config.subtitle.user_offset_ms,
             config,
@@ -319,6 +369,13 @@ impl App {
             audio: Some(audio),
             audio_active_key: None,
             audio_last_error: None,
+            hotkeys,
+            export_worker: Some(export_worker),
+            queue_dir,
+            locked: false,
+            visible: true,
+            edit_mode: false,
+            show_status: true,
         }
     }
 
@@ -451,7 +508,9 @@ impl App {
     pub fn apply_passthrough(&mut self, ctx: &egui::Context) {
         let interactive = match self.cursor_local {
             Some(pos) => {
-                self.shift_held || self.interactive_rects.iter().any(|rect| rect.contains(pos))
+                self.locked
+                    || self.shift_held
+                    || self.interactive_rects.iter().any(|rect| rect.contains(pos))
             }
             // No global cursor (native Wayland): the overlay must stay interactive so it can
             // still be used; manual-region mode is the M7 fallback. Documented in AGENTS.md.
@@ -634,11 +693,227 @@ impl App {
             .push(format!("offset {:+} ms", self.user_offset_ms), false);
     }
 
+    // -------------------------------------------------------------------------------------
+    // M7: global hotkey actions + mining export
+    // -------------------------------------------------------------------------------------
+
+    /// Drain global hotkey presses and apply them. Called every frame; a pressed hotkey is
+    /// translated by [`AppAction`] into a real action below (never a silent no-op).
+    pub fn poll_hotkeys(&mut self) {
+        let Some(actions) = self.hotkeys.as_mut().map(GlobalHotkeys::poll) else {
+            return;
+        };
+        for action in actions {
+            tracing::debug!(?action, "global hotkey pressed");
+            self.apply_action(action);
+        }
+    }
+
+    fn apply_action(&mut self, action: AppAction) {
+        match action {
+            AppAction::ExportCard => {
+                self.export_current_card();
+            }
+            AppAction::OffsetBack => {
+                let step = self.config.subtitle.offset_step_ms;
+                self.adjust_offset(-step);
+            }
+            AppAction::OffsetForward => {
+                let step = self.config.subtitle.offset_step_ms;
+                self.adjust_offset(step);
+            }
+            AppAction::ToggleLock => {
+                self.locked = !self.locked;
+                self.toasts.push(
+                    format!(
+                        "overlay {}",
+                        if self.locked { "locked" } else { "unlocked" }
+                    ),
+                    false,
+                );
+            }
+            AppAction::ToggleVisibility => {
+                self.visible = !self.visible;
+                self.toasts.push(
+                    format!("overlay {}", if self.visible { "shown" } else { "hidden" }),
+                    false,
+                );
+            }
+            AppAction::OpenSubtitle => self.open_subtitle_dialog(),
+            AppAction::ClockStartPause => {
+                self.manual.toggle_play_pause();
+            }
+            AppAction::ClockSeekBack => {
+                self.manual.seek_by(Duration::from_secs(5), false);
+            }
+            AppAction::ClockSeekForward => {
+                self.manual.seek_by(Duration::from_secs(5), true);
+            }
+            AppAction::ToggleEditMode => {
+                self.edit_mode = !self.edit_mode;
+                self.toasts.push(
+                    format!(
+                        "edit mode {} (editing UI arrives with the settings panel)",
+                        if self.edit_mode { "on" } else { "off" }
+                    ),
+                    false,
+                );
+            }
+            AppAction::ToggleStatus => {
+                self.show_status = !self.show_status;
+                self.toasts.push(
+                    format!(
+                        "status strip {}",
+                        if self.show_status { "shown" } else { "hidden" }
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+
+    /// File dialog for a subtitle file. Linux uses the XDG desktop portal (`rfd` with the
+    /// `xdg-portal` backend — no GTK dependency, matching the AGENTS.md Wayland story);
+    /// other platforms fall back to drag-and-drop onto the overlay.
+    fn open_subtitle_dialog(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let picked = rfd::FileDialog::new()
+                .add_filter("Subtitles", &["srt", "vtt", "ass", "ssa", "sub"])
+                .pick_file();
+            match picked {
+                Some(path) => {
+                    let _ = self.loader_tx.send(UiCommand::LoadSubtitles(path));
+                }
+                None => {
+                    self.toasts
+                        .push("open subtitle cancelled".to_owned(), false);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.toasts.push(
+                "file dialog is only wired for Linux (XDG portal); drag the subtitle file onto the overlay instead".to_owned(),
+                true,
+            );
+        }
+    }
+
+    /// Gather the current cue into an [`ExportSource`] (UI thread — [`Dictionary`] is not
+    /// `Sync`) and hand it to the export worker. Returns `false` with a toast when nothing
+    /// is mineable or the worker is busy.
+    pub fn export_current_card(&mut self) -> bool {
+        // Copy the pieces we need out of the track first: the borrow on `self.track` must
+        // end before we call `&mut self` methods below.
+        let Some(index) = self.active_cue else {
+            self.toasts.push(
+                "nothing to export: no active cue (pause/seek into a line)".to_owned(),
+                true,
+            );
+            return false;
+        };
+        let Some((text, cue_start, cue_end, source_name)) = (|| {
+            let track = self.track.as_ref()?;
+            let cue = track.cue(index)?;
+            let source_name = track
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "subtitle".to_owned());
+            Some((cue.text.clone(), cue.start, cue.end, source_name))
+        })() else {
+            self.toasts.push(
+                "nothing to export: no subtitle track loaded".to_owned(),
+                true,
+            );
+            return false;
+        };
+
+        let tokens = self.tokens_cached(&text);
+        // Prefer the hovered/pinned token; fall back to the first content word of the cue.
+        let surface = self
+            .hover_token
+            .or(self.pinned_token)
+            .and_then(|index| tokens.get(index))
+            .map(|token| token.surface.clone())
+            .or_else(|| {
+                tokens
+                    .iter()
+                    .find(|token| token.is_content_word())
+                    .map(|token| token.surface.clone())
+            });
+        let Some(surface) = surface else {
+            self.toasts.push(
+                "nothing to export: hover a token in the line first".to_owned(),
+                true,
+            );
+            return false;
+        };
+
+        let resolution = match &mut self.dictionary {
+            Some(dictionary) => match dictionary.resolve_detailed(&surface) {
+                Ok(resolution) => resolution,
+                Err(err) => {
+                    tracing::warn!(error = %err, surface, "dictionary lookup failed during export");
+                    None
+                }
+            },
+            None => None,
+        };
+        let card = mine_card(
+            &surface,
+            resolution.as_ref(),
+            &text,
+            "",
+            cue_start.as_secs_f64(),
+            &source_name,
+        );
+
+        // Audio window around the cue, only when a ring exists (the worker skips media it
+        // cannot produce — e.g. the buffer ran past the line — with a note in the result).
+        let ring = self.audio.as_ref().and_then(|audio| audio.ring());
+        let audio_window = ring.as_ref().map(|_| {
+            let pad = 0.4;
+            let start = (cue_start.as_secs_f64() - pad).max(0.0);
+            let end = (cue_end.as_secs_f64() + pad).max(start + 1.5);
+            (start, end)
+        });
+
+        let source = ExportSource {
+            card,
+            anki: self.config.anki.clone(),
+            capture: self.config.capture.clone(),
+            queue_dir: self.queue_dir.clone(),
+            ring,
+            audio_window,
+            nonce: rand::random(),
+        };
+        let accepted = self
+            .export_worker
+            .as_ref()
+            .is_some_and(|worker| worker.submit(source));
+        if accepted {
+            self.toasts.push(format!("exporting '{surface}'…"), false);
+            true
+        } else {
+            self.toasts.push(
+                "export worker busy — try again in a moment".to_owned(),
+                true,
+            );
+            false
+        }
+    }
+
     /// Ask every worker to stop and join it. Safe to call more than once.
     pub fn shutdown_workers(&mut self) {
         let _ = self.loader_tx.send(UiCommand::Shutdown);
         self.clock.shutdown();
         self.audio = None; // drop joins the capture thread
+        if let Some(mut worker) = self.export_worker.take() {
+            worker.stop();
+            worker.join();
+        }
         for hook in std::mem::take(&mut self.shutdown_hooks) {
             hook();
         }
@@ -663,6 +938,7 @@ impl eframe::App for App {
         }
 
         self.handle_local_keys(ui);
+        self.poll_hotkeys();
         self.update_timing();
         self.update_cursor(frame, ui.ctx());
 
