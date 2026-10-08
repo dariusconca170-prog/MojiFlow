@@ -89,6 +89,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     paint_token_highlights(app, ui, &layout);
     paint_outlined_text(ui, layout.origin, &layout.galley);
 
+    // A manual clock that hasn't started yet gets a visible invitation — it was invisible
+    // friction that the clock sits paused at zero until Ctrl+Alt+Space.
+    if app.waiting_for_start() {
+        paint_waiting_hint(app, ui, area, layout.origin.y);
+    }
+
     let popover_rect = paint_popover(app, ui, &layout, area);
 
     // Interactive rectangles: every token plus the popover (when open). The status strip and
@@ -108,6 +114,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     paint_toasts(app, ui, area);
     handle_quit(ui);
+}
+
+/// Dim invitation shown while a manual clock is still at zero with subtitles loaded, so
+/// the "press the clock hotkey when the video starts" step is visible instead of magical.
+fn paint_waiting_hint(app: &App, ui: &egui::Ui, area: Rect, sub_top: f32) {
+    let dim = Color32::from_rgb(148, 163, 184);
+    let label = format!(
+        "waiting for video — press {} when it starts",
+        app.config.hotkeys.clock_start_pause
+    );
+    let hint = ui.fonts_mut(|f| {
+        f.layout(
+            label,
+            FontId::proportional(16.0),
+            dim,
+            f32::INFINITY, // no wrap: one line
+        )
+    });
+    let x = (area.center().x - hint.size().x / 2.0).max(area.left());
+    // Above the active subtitle; otherwise pinned near the bottom edge like a real sub.
+    let y = if app.active_cue.is_some() {
+        (sub_top - hint.size().y - 8.0).max(area.top())
+    } else {
+        area.bottom() - MARGIN - hint.size().y
+    };
+    ui.painter().galley(Pos2::new(x, y), hint, dim);
 }
 
 fn build_layout(

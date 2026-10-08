@@ -5,13 +5,14 @@
 //! up exactly when there is something new (never busy-polling).
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::capture::AudioCapture;
 use crate::capture::window::GlobalPointer;
 use crate::clock::{self, manual::ManualClock, PlaybackClock};
-use crate::config::Config;
+use crate::config::{ClockSource, Config};
 use crate::dict::Dictionary;
 use crate::error::MlError;
 use crate::export::{mine_card, ExportSource, ExportWorker};
@@ -172,6 +173,8 @@ pub struct App {
     /// Control handle for the manual clock (shares state with `clock` when manual).
     pub manual: ManualClock,
     events_rx: crossbeam_channel::Receiver<CoreEvent>,
+    /// Sender half, kept so the grab worker (spawned later) can post results.
+    events_tx: crossbeam_channel::Sender<CoreEvent>,
     loader_tx: crossbeam_channel::Sender<UiCommand>,
     /// Workers that must be joined/stopped at exit.
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
@@ -242,6 +245,29 @@ pub struct App {
     last_topmost_check: Instant,
     /// Only surface the always-on-top unsupported error once (e.g. macOS).
     topmost_error_logged: bool,
+    /// Whether the clock has ever advanced (set on the first play/seek) — gates the
+    /// overlay's "waiting for video" hint.
+    pub ever_started: bool,
+    /// True once the first-frame auto bottom-center placement has run.
+    placed: bool,
+    /// Whether fullscreen-follow currently has the overlay expanded to fullscreen.
+    following_fullscreen: bool,
+    /// Window rect to restore when fullscreen-follow exits.
+    saved_window_rect: Option<[f32; 4]>,
+    /// Last time the fullscreen-follow poll ran (same cadence as the topmost check).
+    last_fullscreen_check: Instant,
+    /// Whether the fullscreen-follow unsupported error was surfaced (once).
+    fullscreen_logged: bool,
+    /// yt-dlp grab state shared with the running download thread.
+    pub grab_shared: Arc<crate::grab::GrabShared>,
+    /// Join handle for the active grab thread, if any.
+    grab_thread: Option<std::thread::JoinHandle<()>>,
+    /// `yt-dlp --version` probe result as a display string (None = not probed yet).
+    pub grab_version: Option<String>,
+    /// URL entered in the dashboard grab card.
+    pub grab_url: String,
+    /// Whether the dashboard grab card should also fetch Japanese subtitles.
+    pub grab_with_subs: bool,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -338,7 +364,22 @@ impl App {
 
         // M7: mining export — one worker thread with its own tokio runtime so the Anki
         // round trip (and media encoding) never touches the UI thread.
-        let export_worker = ExportWorker::spawn(export_events, Arc::clone(&repaint));
+        let export_worker = ExportWorker::spawn(export_events.clone(), Arc::clone(&repaint));
+
+        // Probe the yt-dlp binary off the UI thread (Python startup is ~100 ms); the
+        // first "grab" status line becomes `grab_version` for the dashboard chip.
+        let probe_tx = export_events.clone();
+        std::thread::spawn(move || {
+            let version = crate::grab::probe_version();
+            let _ = probe_tx.send(CoreEvent::Status {
+                component: "grab",
+                text: version
+                    .map(|v| format!("yt-dlp {v} ready"))
+                    .unwrap_or_else(|| {
+                        "yt-dlp not found on PATH (sudo apt install yt-dlp)".to_owned()
+                    }),
+            });
+        });
 
         // Offline queue lives next to the config file; temp dir is the fallback when the
         // config path is unknown (e.g. default config without a persisted location).
@@ -347,6 +388,10 @@ impl App {
             .and_then(|path| path.parent())
             .map(|dir| dir.join("queue"))
             .unwrap_or_else(|| std::env::temp_dir().join("medialingual-queue"));
+
+        // A negative rect component is the "auto bottom-center" sentinel; compute before
+        // `config` is moved into the struct.
+        let placed = config.window.rect[0] >= 0.0 && config.window.rect[1] >= 0.0;
 
         Self {
             user_offset_ms: config.subtitle.user_offset_ms,
@@ -362,6 +407,8 @@ impl App {
             clock,
             manual,
             events_rx,
+            // The grab worker posts results on the same bus the export worker uses.
+            events_tx: export_events,
             loader_tx,
             shutdown_hooks: vec![Box::new(move || {
                 if let Ok(mut guard) = loader_join.lock() {
@@ -398,6 +445,17 @@ impl App {
             last_action: None,
             last_topmost_check: Instant::now(),
             topmost_error_logged: false,
+            ever_started: false,
+            placed,
+            following_fullscreen: false,
+            saved_window_rect: None,
+            last_fullscreen_check: Instant::now(),
+            fullscreen_logged: false,
+            grab_shared: Arc::new(crate::grab::GrabShared::default()),
+            grab_thread: None,
+            grab_version: None,
+            grab_url: String::new(),
+            grab_with_subs: true,
         }
     }
 
@@ -439,6 +497,9 @@ impl App {
                 },
                 Ok(CoreEvent::Status { component, text }) => {
                     tracing::info!(component, text = %text, "status");
+                    if component == "grab" && self.grab_version.is_none() {
+                        self.grab_version = Some(text.clone());
+                    }
                     self.status_log.push_back(text.clone());
                     while self.status_log.len() > 6 {
                         self.status_log.pop_front();
@@ -668,11 +729,87 @@ impl App {
 
     /// Advance timing for this frame: pick the active cue from `clock + offset`.
     pub fn update_timing(&mut self) {
+        if self.clock.is_playing() {
+            self.ever_started = true;
+        }
         let effective = clock::effective_time(self.clock.as_ref(), self.user_offset_ms);
         self.active_cue = match &self.track {
             Some(track) => track.active_at(effective),
             None => None,
         };
+    }
+
+    /// Whether the overlay should show the "press the clock hotkey when the video starts"
+    /// hint: a manual clock that has never advanced, with subtitles loaded.
+    pub fn waiting_for_start(&self) -> bool {
+        !self.ever_started
+            && self.track.is_some()
+            && self.config.clock.source == ClockSource::Manual
+    }
+
+    /// Start a yt-dlp grab from the dashboard card, off the UI thread.
+    pub fn start_grab(&mut self) {
+        if self.grab_shared.running.load(Ordering::SeqCst) {
+            self.toasts.push("grab already running".to_owned(), true);
+            return;
+        }
+        let url = self.grab_url.trim().to_owned();
+        if url.is_empty() {
+            self.toasts.push("enter a video URL first".to_owned(), true);
+            return;
+        }
+        let mut config = self.config.grab.clone();
+        if !self.grab_with_subs {
+            config.sub_langs.clear();
+        }
+        let spec = crate::grab::GrabSpec::from_config(&config, url);
+        if let Err(err) = std::fs::create_dir_all(&spec.out_dir) {
+            self.toasts.push(
+                format!("cannot create {}: {err}", spec.out_dir.display()),
+                true,
+            );
+            return;
+        }
+        let shared = Arc::clone(&self.grab_shared);
+        shared.cancel.store(false, Ordering::SeqCst);
+        let tx = self.events_tx.clone();
+        let open_in_mpv = config.open_in_mpv;
+        let socket = self.config.clock.mpv_socket.clone();
+        let handle = std::thread::spawn(move || {
+            let source = spec.url.clone();
+            let _ = tx.send(CoreEvent::Status {
+                component: "grab",
+                text: format!("grabbing {source}…"),
+            });
+            match crate::grab::run("yt-dlp", &spec, &shared) {
+                Ok(path) => {
+                    let subs = !spec.sub_langs.trim().is_empty();
+                    let _ = tx.send(CoreEvent::Status {
+                        component: "grab",
+                        text: format!(
+                            "saved {}{}",
+                            path.display(),
+                            if subs { " + subs" } else { "" }
+                        ),
+                    });
+                    if open_in_mpv {
+                        if let Err(err) = crate::grab::open_in_mpv(&path, &socket) {
+                            let _ = tx.send(CoreEvent::Status {
+                                component: "grab",
+                                text: err.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(CoreEvent::Status {
+                        component: "grab",
+                        text: format!("grab failed: {err}"),
+                    });
+                }
+            }
+        });
+        self.grab_thread = Some(handle);
     }
 
     /// Handle local (overlay-focused) keys for M2: `[`/`]` offset, `Space`
@@ -1001,6 +1138,12 @@ impl App {
 
     /// Ask every worker to stop and join it. Safe to call more than once.
     pub fn shutdown_workers(&mut self) {
+        // Cancel an in-flight yt-dlp grab and join its thread so the app never exits
+        // with a download still running.
+        if let Some(handle) = self.grab_thread.take() {
+            self.grab_shared.cancel.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
         let _ = self.loader_tx.send(UiCommand::Shutdown);
         self.clock.shutdown();
         self.audio = None; // drop joins the capture thread
@@ -1072,6 +1215,63 @@ impl eframe::App for App {
             }
         }
 
+        // First-run placement: the default rect sentinel (negative x/y) means
+        // "bottom-center of the primary screen" — real subtitles live at the bottom,
+        // above the video controls instead of over the browser tabs.
+        if !self.placed {
+            self.placed = true;
+            let size = [self.config.window.rect[2], self.config.window.rect[3]];
+            let rect = bottom_center_rect(ui.ctx().content_rect(), size);
+            self.config.window.rect = rect;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
+                    rect[0], rect[1],
+                )));
+        }
+
+        // Fullscreen-follow: while the video window is fullscreen, expand the overlay to
+        // fullscreen too (KWin keeps fullscreen windows above always-on-top ones, so this
+        // is the only way to keep subtitles visible over a fullscreen player). Restores
+        // the saved rect when the player leaves fullscreen.
+        if self.config.window.follow_fullscreen
+            && self.last_fullscreen_check.elapsed() >= Duration::from_millis(750)
+        {
+            self.last_fullscreen_check = Instant::now();
+            match self.pointer.is_any_fullscreen() {
+                Ok(true) => {
+                    if !self.following_fullscreen {
+                        self.following_fullscreen = true;
+                        self.saved_window_rect = Some(self.config.window.rect);
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
+                }
+                Ok(false) => {
+                    if self.following_fullscreen {
+                        self.following_fullscreen = false;
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        if let Some(rect) = self.saved_window_rect.take() {
+                            if rect[0] >= 0.0 && rect[1] >= 0.0 {
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                        egui::Pos2::new(rect[0], rect[1]),
+                                    ));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !self.fullscreen_logged {
+                        self.fullscreen_logged = true;
+                        tracing::warn!(error = %err, "fullscreen-follow unavailable");
+                        self.toasts
+                            .push(format!("fullscreen-follow unavailable: {err}"), true);
+                    }
+                }
+            }
+        }
+
         // Enable/disable click-through from the interactive regions the overlay just
         // computed. Deferred viewport commands apply after this frame.
         self.apply_passthrough(ui.ctx());
@@ -1092,5 +1292,39 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shutdown_workers();
+    }
+}
+
+/// Bottom-center placement for the overlay: centered horizontally, sitting just above the
+/// bottom edge so it clears panels/taskbars. Pure and testable.
+pub fn bottom_center_rect(screen: egui::Rect, size: [f32; 2]) -> [f32; 4] {
+    const BOTTOM_GAP: f32 = 48.0;
+    let x = (screen.center().x - size[0] / 2.0).max(screen.left());
+    let y = (screen.bottom() - BOTTOM_GAP - size[1]).max(screen.top());
+    [x, y, size[0], size[1]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_center_rect_is_centered_above_the_bottom_edge() {
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::new(0.0, 0.0), egui::Vec2::new(1920.0, 1080.0));
+        let rect = bottom_center_rect(screen, [1100.0, 320.0]);
+        assert_eq!(rect[0], 410.0); // (1920 - 1100) / 2
+        assert_eq!(rect[1], 1080.0 - 48.0 - 320.0);
+        assert_eq!([rect[2], rect[3]], [1100.0, 320.0]);
+    }
+
+    #[test]
+    fn bottom_center_rect_small_screen_is_clamped() {
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::new(0.0, 0.0), egui::Vec2::new(400.0, 300.0));
+        // Overlay wider than the screen: x clamps to the left edge, y to the top.
+        let rect = bottom_center_rect(screen, [1100.0, 320.0]);
+        assert_eq!(rect[0], 0.0);
+        assert_eq!(rect[1], 0.0);
     }
 }

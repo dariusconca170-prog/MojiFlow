@@ -20,6 +20,7 @@ pub struct Config {
     pub hotkeys: HotkeysConfig,
     pub audio: AudioConfig,
     pub capture: CaptureConfig,
+    pub grab: GrabConfig,
     pub stt: SttConfig,
     pub anki: AnkiConfig,
     pub dictionary: DictionaryConfig,
@@ -29,6 +30,8 @@ pub struct Config {
 #[serde(default)]
 pub struct WindowConfig {
     /// Overlay position and size in logical pixels, `[x, y, w, h]`.
+    /// A negative `x` or `y` is a sentinel meaning "auto-place at the bottom-center of the
+    /// primary screen on the first frame" (the app computes and applies the real rect then).
     pub rect: [f32; 4],
     pub always_on_top: bool,
     pub show_decorations: bool,
@@ -36,16 +39,20 @@ pub struct WindowConfig {
     pub backing_box: bool,
     /// Whether the control-room dashboard window is open (hotkey Ctrl+Alt+D).
     pub dashboard_open: bool,
+    /// When any fullscreen window appears (e.g. the video player), expand the overlay to
+    /// fullscreen too so the subtitle stays visible; restore the rect when it leaves.
+    pub follow_fullscreen: bool,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            rect: [96.0, 96.0, 1100.0, 320.0],
+            rect: [-1.0, -1.0, 1100.0, 320.0],
             always_on_top: true,
             show_decorations: false,
             backing_box: true,
             dashboard_open: true,
+            follow_fullscreen: true,
         }
     }
 }
@@ -208,6 +215,39 @@ impl Default for CaptureConfig {
             manual_rect: [0.0, 0.0, 1280.0, 720.0],
             max_width: 1280,
             jpeg_quality: 85,
+        }
+    }
+}
+
+/// "Grab video" (M8): download a stream via the user-installed `yt-dlp` binary.
+///
+/// The app never implements extraction itself — that is yt-dlp's job (thousands of sites,
+/// maintained daily). We only build the argument list, run it off the UI thread, and open
+/// the resulting file in mpv when configured. DRM'd streams cannot be downloaded at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GrabConfig {
+    /// Directory the video (and its subtitles) are saved into.
+    pub output_dir: String,
+    /// `yt-dlp -f` selection; the default is best-video + best-audio merged.
+    pub format: String,
+    /// Subtitle language codes to fetch, comma-separated. Empty = no subtitles.
+    pub sub_langs: String,
+    /// Convert fetched subtitles to `.srt` (what `Ctrl+Alt+O` expects).
+    pub convert_subs: bool,
+    /// Spawn `mpv --input-ipc-server=<socket> <file>` after a successful grab so the
+    /// overlay follows playback automatically (`clock.source = "mpv_ipc"`).
+    pub open_in_mpv: bool,
+}
+
+impl Default for GrabConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: "~/Videos/Medialingual".to_owned(),
+            format: "bv*+ba".to_owned(),
+            sub_langs: "ja".to_owned(),
+            convert_subs: true,
+            open_in_mpv: true,
         }
     }
 }

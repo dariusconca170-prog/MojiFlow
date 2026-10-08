@@ -10,6 +10,7 @@
 //! Transport buttons (start/pause/seek) only drive the manual clock; a live source (mpv,
 //! MPRIS) is read-only this milestone — steering those arrives with the M8 settings panel.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
@@ -87,6 +88,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 subtitle_card(app, ui);
                 audio_card(app, ui);
                 export_card(app, ui);
+                grab_card(app, ui);
                 hotkeys_card(app, ui);
             });
     });
@@ -428,6 +430,49 @@ fn export_card(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new(line).color(TEXT).monospace().size(11.0));
             }
         }
+    });
+}
+
+fn grab_card(app: &mut App, ui: &mut egui::Ui) {
+    render_card(ui, "Grab video (yt-dlp)", |ui| {
+        ui.label(
+            RichText::new(
+                "Download a stream when there's no save/download button. The file lands in \
+                 the grab folder and opens in mpv, so the overlay follows playback \
+                 automatically (clock.source = \"mpv_ipc\").",
+            )
+            .color(DIM)
+            .size(11.0),
+        );
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut app.grab_url)
+                .hint_text("https://…")
+                .desired_width(f32::INFINITY),
+        );
+        ui.checkbox(
+            &mut app.grab_with_subs,
+            "also download Japanese subtitles (.srt)",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let running = app.grab_shared.running.load(Ordering::SeqCst);
+            let clicked = ui
+                .add_enabled(
+                    !running,
+                    egui::Button::new(RichText::new("Grab").strong().color(BG))
+                        .fill(ACCENT)
+                        .corner_radius(6),
+                )
+                .clicked();
+            if clicked {
+                app.start_grab();
+            }
+            match &app.grab_version {
+                Some(line) => ui.label(RichText::new(line).color(TEXT).monospace().size(11.0)),
+                None => ui.label(RichText::new("probing yt-dlp…").color(DIM).size(11.0)),
+            }
+        });
     });
 }
 

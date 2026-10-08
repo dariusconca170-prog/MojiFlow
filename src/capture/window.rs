@@ -65,6 +65,87 @@ impl GlobalPointer {
     pub fn set_always_on_top(&self, title: &str, enable: bool) -> Result<(), WindowError> {
         platform_set_always_on_top(self, title, enable)
     }
+
+    /// True when any top-level window (other than our own overlay) is currently
+    /// fullscreen — the signal `App` uses for fullscreen-follow (expand the overlay to
+    /// fullscreen so subtitles stay visible over the video).
+    pub fn is_any_fullscreen(&self) -> Result<bool, WindowError> {
+        platform_any_fullscreen(self)
+    }
+}
+#[cfg(target_os = "linux")]
+fn platform_any_fullscreen(pointer: &GlobalPointer) -> Result<bool, WindowError> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let conn = pointer.conn.as_ref().ok_or(WindowError::Unsupported(
+        "no X11 connection for fullscreen query",
+    ))?;
+    let root = conn.setup().roots[0].root;
+    let intern = |name: &[u8]| -> Result<u32, WindowError> {
+        Ok(conn
+            .intern_atom(false, name)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .atom)
+    };
+    let name_atom = intern(b"_NET_WM_NAME")?;
+    let state_atom = intern(b"_NET_WM_STATE")?;
+    let full_atom = intern(b"_NET_WM_STATE_FULLSCREEN")?;
+
+    // Walk the tree like `platform_set_always_on_top` (WM frames reparent the client
+    // windows). Skip our own overlay by title: once we put it fullscreen it would
+    // otherwise match itself forever and never restore.
+    let mut queue = vec![root];
+    while let Some(w) = queue.pop() {
+        let children = conn
+            .query_tree(w)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .children;
+        for child in children {
+            let name = conn
+                .get_property(false, child, name_atom, 0u32, 0, 4096)
+                .map_err(|err| WindowError::X11(err.to_string()))?
+                .reply()
+                .map_err(|err| WindowError::X11(err.to_string()))?;
+            if !name.value.is_empty()
+                && String::from_utf8_lossy(&name.value).trim_end_matches('\0')
+                    == crate::platform::OVERLAY_TITLE
+            {
+                continue;
+            }
+            let state = conn
+                .get_property(false, child, state_atom, 0u32, 0, 32)
+                .map_err(|err| WindowError::X11(err.to_string()))?
+                .reply()
+                .map_err(|err| WindowError::X11(err.to_string()))?;
+            if state
+                .value32()
+                .is_some_and(|mut atoms| atoms.any(|atom| atom == full_atom))
+            {
+                return Ok(true);
+            }
+            queue.push(child);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError> {
+    Err(WindowError::Unsupported(
+        "fullscreen-follow is X11-only in this build",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError> {
+    Err(WindowError::Unsupported(
+        "fullscreen-follow is X11-only in this build",
+    ))
 }
 
 impl Default for GlobalPointer {

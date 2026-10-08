@@ -13,6 +13,7 @@ pub mod deinflect;
 pub mod dict;
 pub mod error;
 pub mod export;
+pub mod grab;
 pub mod gui;
 pub mod hotkey;
 pub mod platform;

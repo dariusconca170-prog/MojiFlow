@@ -128,7 +128,20 @@ fn main() -> anyhow::Result<()> {
         // Start click-through; `App::apply_passthrough` re-enables input only while the
         // cursor is over an interactive region (see AGENTS.md).
         .with_mouse_passthrough(true)
-        .with_position([config.window.rect[0], config.window.rect[1]])
+        // A negative rect component is the auto bottom-center sentinel — let the WM place
+        // the window and let `App` move it on the first frame.
+        .with_position([
+            if config.window.rect[0] >= 0.0 {
+                config.window.rect[0]
+            } else {
+                0.0
+            },
+            if config.window.rect[1] >= 0.0 {
+                config.window.rect[1]
+            } else {
+                0.0
+            },
+        ])
         .with_inner_size([config.window.rect[2], config.window.rect[3]]);
 
     let options = eframe::NativeOptions {
