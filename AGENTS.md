@@ -82,4 +82,6 @@ cargo xtask build-dict                # download + build JMdict/pitch/frequency 
 
 ## Manual QA checklist
 
+- **Headless interaction loop (Xvfb, zero intrusion on the live session).** `Xvfb :99 -screen 0 1920x1080x24`, run the app with `HOME=<scratch> DISPLAY=:99`, drive with `DISPLAY=:99 xdotool` + `xwd` captures decoded via `ffmpeg -i *.xwd *.png`. Proven pattern 2026-10-09: global hotkeys, transport, seeks, token hover/popover, dashboard scrolling, and the full Grab-button download. Two gotchas: egui label clicks toggle checkboxes (click field centers), and headless key delivery needs explicit `xdotool windowfocus` (no WM, no click-to-focus). The portal file picker does NOT work headless (no session bus/backends) — a temporary `ML_AUTOLOAD`-style patch may load tracks for screenshots but must be reverted before commit.
+
 (filled in during M4–M8)
