@@ -1,0 +1,58 @@
+# MediaLingual-Native CI (M8): the full development gate on every push/PR.
+#
+# System packages mirror the lessons in AGENTS.md — notably `libgbm-dev` (xcap pulls
+# `-lgbm` at link time; runtime-only `libgbm1` is not enough) and `libasound2-dev`
+# (cpal ALSA). The dictionary build needs network (JMdict/Kanjium sources).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgbm-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Build dictionaries
+        run: cargo xtask build-dict
+
+      - name: fmt (app + xtask)
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path xtask/Cargo.toml --check
+
+      - name: clippy (app + xtask)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --manifest-path xtask/Cargo.toml -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: build (debug + release)
+        run: |
+          cargo build
+          cargo build --release
+
+      - name: build with whisper feature
+        run: cargo build --features whisper
