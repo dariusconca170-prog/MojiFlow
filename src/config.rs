@@ -229,7 +229,9 @@ impl Default for CaptureConfig {
 pub struct GrabConfig {
     /// Directory the video (and its subtitles) are saved into.
     pub output_dir: String,
-    /// `yt-dlp -f` selection; the default is best-video + best-audio merged.
+    /// `yt-dlp -f` selection. The `/b` fallback matters: `bv*+ba` alone *fails* on
+    /// direct-file URLs (a single mp4 has nothing to merge — verified live 2026-10-09),
+    /// while `bv*+ba/b` falls back to the best single file there.
     pub format: String,
     /// Subtitle language codes to fetch, comma-separated. Empty = no subtitles.
     pub sub_langs: String,
@@ -244,7 +246,7 @@ impl Default for GrabConfig {
     fn default() -> Self {
         Self {
             output_dir: "~/Videos/Medialingual".to_owned(),
-            format: "bv*+ba".to_owned(),
+            format: "bv*+ba/b".to_owned(),
             sub_langs: "ja".to_owned(),
             convert_subs: true,
             open_in_mpv: true,

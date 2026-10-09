@@ -772,6 +772,9 @@ impl App {
         }
         let shared = Arc::clone(&self.grab_shared);
         shared.cancel.store(false, Ordering::SeqCst);
+        // Claim "running" on the UI thread: the worker sets it again, but this closes
+        // the double-click race between spawn and the worker's first store.
+        shared.running.store(true, Ordering::SeqCst);
         let tx = self.events_tx.clone();
         let open_in_mpv = config.open_in_mpv;
         let socket = self.config.clock.mpv_socket.clone();

@@ -132,6 +132,7 @@ pub fn run(program: &str, spec: &GrabSpec, shared: &GrabShared) -> Result<PathBu
                 Ok(None) => std::thread::sleep(Duration::from_millis(200)),
                 Err(err) => {
                     let _ = child.kill();
+                    shared.running.store(false, Ordering::SeqCst);
                     return Err(GrabError::Run(err.to_string()));
                 }
             }
@@ -220,7 +221,7 @@ mod tests {
         GrabSpec {
             url: url.to_owned(),
             out_dir: PathBuf::from("/tmp/ml-out"),
-            format: "bv*+ba".to_owned(),
+            format: "bv*+ba/b".to_owned(),
             sub_langs: sub_langs.to_owned(),
             convert_subs: true,
         }
@@ -234,7 +235,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.contains(&"--no-playlist".to_owned()));
-        assert!(args.contains(&"-f".to_owned()) && args.contains(&"bv*+ba".to_owned()));
+        assert!(args.contains(&"-f".to_owned()) && args.contains(&"bv*+ba/b".to_owned()));
         assert!(args.contains(&"--write-subs".to_owned()));
         assert!(args.contains(&"--sub-langs".to_owned()) && args.contains(&"ja".to_owned()));
         assert!(args.contains(&"--convert-subs".to_owned()) && args.contains(&"srt".to_owned()));
