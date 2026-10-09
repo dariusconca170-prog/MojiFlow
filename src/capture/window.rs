@@ -72,6 +72,12 @@ impl GlobalPointer {
     pub fn is_any_fullscreen(&self) -> Result<bool, WindowError> {
         platform_any_fullscreen(self)
     }
+
+    /// Primary screen size in physical pixels (X11 root geometry). The app divides by
+    /// `pixels_per_point` to get logical points for placement math.
+    pub fn primary_screen_size(&self) -> Result<(u32, u32), WindowError> {
+        platform_screen_size(self)
+    }
 }
 #[cfg(target_os = "linux")]
 fn platform_any_fullscreen(pointer: &GlobalPointer) -> Result<bool, WindowError> {
@@ -145,6 +151,34 @@ fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError
 fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError> {
     Err(WindowError::Unsupported(
         "fullscreen-follow is X11-only in this build",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_screen_size(pointer: &GlobalPointer) -> Result<(u32, u32), WindowError> {
+    use x11rb::connection::Connection as _;
+
+    let conn = pointer.conn.as_ref().ok_or(WindowError::Unsupported(
+        "no X11 connection for screen-size query",
+    ))?;
+    let screen = &conn.setup().roots[0];
+    Ok((
+        u32::from(screen.width_in_pixels),
+        u32::from(screen.height_in_pixels),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_screen_size(_pointer: &GlobalPointer) -> Result<(u32, u32), WindowError> {
+    Err(WindowError::Unsupported(
+        "screen-size query is X11-only in this build",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_screen_size(_pointer: &GlobalPointer) -> Result<(u32, u32), WindowError> {
+    Err(WindowError::Unsupported(
+        "screen-size query is X11-only in this build",
     ))
 }
 

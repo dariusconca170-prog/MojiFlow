@@ -462,4 +462,26 @@ mod tests {
         let lefts: Vec<f32> = hits.iter().map(|hit| hit.rects[0].left()).collect();
         assert!(lefts.windows(2).all(|pair| pair[0] <= pair[1]), "{lefts:?}");
     }
+
+    /// Headless render test: the waiting hint must shape and paint real primitives
+    /// without a window (proves the paint path behind `waiting_for_start` never panics).
+    #[test]
+    fn waiting_hint_paints_shapes_headlessly() {
+        let ctx = egui::Context::default();
+        let _ = crate::gui::fonts::install_cjk_fonts(&ctx);
+        let app = crate::app::App::new(
+            Config::default(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            ctx.clone(),
+        );
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1100.0, 320.0));
+            paint_waiting_hint(&app, ui, area, 200.0);
+        });
+        assert!(!output.shapes.is_empty(), "hint produced no shapes");
+        // No renderer here to consume the atlas upload; clear it like the fonts test.
+        output.textures_delta.clear();
+    }
 }

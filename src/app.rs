@@ -1217,16 +1217,29 @@ impl eframe::App for App {
 
         // First-run placement: the default rect sentinel (negative x/y) means
         // "bottom-center of the primary screen" — real subtitles live at the bottom,
-        // above the video controls instead of over the browser tabs.
+        // above the video controls instead of over the browser tabs. Uses the X11 root
+        // geometry (physical pixels / ppp), never the viewport rect (window-local).
         if !self.placed {
             self.placed = true;
             let size = [self.config.window.rect[2], self.config.window.rect[3]];
-            let rect = bottom_center_rect(ui.ctx().content_rect(), size);
-            self.config.window.rect = rect;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
-                    rect[0], rect[1],
-                )));
+            match self.pointer.primary_screen_size() {
+                Ok((w, h)) => {
+                    let ppp = ui.ctx().pixels_per_point();
+                    let screen = egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(w as f32 / ppp, h as f32 / ppp),
+                    );
+                    let rect = bottom_center_rect(screen, size);
+                    self.config.window.rect = rect;
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
+                            rect[0], rect[1],
+                        )));
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "auto bottom-center placement unavailable");
+                }
+            }
         }
 
         // Fullscreen-follow: while the video window is fullscreen, expand the overlay to
@@ -1326,5 +1339,50 @@ mod tests {
         let rect = bottom_center_rect(screen, [1100.0, 320.0]);
         assert_eq!(rect[0], 0.0);
         assert_eq!(rect[1], 0.0);
+    }
+
+    #[test]
+    fn waiting_hint_shows_until_the_manual_clock_first_advances() {
+        use std::path::{Path, PathBuf};
+
+        use crate::config::ClockSource;
+        use crate::subs::{parser, Format, SubtitleTrack};
+
+        let mut app = App::new(
+            Config::default(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        // No track loaded: nothing to wait for, no hint.
+        assert!(!app.waiting_for_start());
+        assert_eq!(app.config.clock.source, ClockSource::Manual);
+
+        let fixture = Path::new("tests/fixtures/simple.srt");
+        let text = std::fs::read_to_string(fixture).unwrap();
+        let (cues, skipped) = parser::parse(Format::Srt, &text, fixture);
+        app.track = Some(
+            SubtitleTrack::new(
+                cues,
+                PathBuf::from(fixture),
+                Format::Srt,
+                "UTF-8".to_owned(),
+                skipped,
+            )
+            .unwrap(),
+        );
+
+        // Manual clock paused at zero: the hint shows.
+        app.update_timing();
+        assert!(app.waiting_for_start());
+
+        // First play clears it for good — pausing again must not bring it back.
+        app.manual.set_playing(true);
+        app.update_timing();
+        assert!(!app.waiting_for_start());
+        app.manual.set_playing(false);
+        app.update_timing();
+        assert!(!app.waiting_for_start());
     }
 }
