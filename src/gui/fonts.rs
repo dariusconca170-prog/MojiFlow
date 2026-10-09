@@ -299,6 +299,22 @@ mod tests {
         assert!(missing.is_empty(), "missing glyphs: {missing:?}");
     }
 
+    /// Pitch-contour alphabet coverage in the embedded fallback. U+203E OVERLINE rendered
+    /// as tofu on 2026-10-09 (no system CJK font installed, and the embedded Noto CJK
+    /// lacks U+203E), so the contour uses U+FFE3 FULLWIDTH OVERLINE + `_` — this pins that.
+    #[test]
+    fn embedded_font_covers_pitch_contour_alphabet() {
+        use ttf_parser::Face;
+        let index = face_index_for_japanese(EMBEDDED_FONT).expect("face index");
+        let face = Face::parse(EMBEDDED_FONT, index).expect("parse embedded font");
+        for ch in ['￣', '_', '[', ']', '0', '1', '2'] {
+            assert!(
+                face.glyph_index(ch).is_some(),
+                "missing contour char {ch:?}"
+            );
+        }
+    }
+
     /// Real render test: install the fonts into an egui context, run a frame, and lay the
     /// demo text out. The galley must contain glyphs and a non-zero width (i.e. the text
     /// was shaped with real metrics, not silently dropped).

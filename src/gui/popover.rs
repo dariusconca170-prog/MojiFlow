@@ -44,7 +44,7 @@ pub fn moras(reading: &str) -> Vec<String> {
 ///
 /// `N == 0` (heiban) rises after the first mora; `N == 1` falls after the first; otherwise
 /// the pitch stays high from the second mora through mora `N` and then drops. `_` marks a
-/// low mora and `‾` a high one, so 猫 (accent 1) reads `‾_`.
+/// low mora and `￣` a high one, so 猫 (accent 1) reads `￣_`.
 pub fn pitch_line(reading: &str, pattern: u8) -> String {
     let count = moras(reading).len();
     let n = usize::from(pattern);
@@ -57,7 +57,7 @@ pub fn pitch_line(reading: &str, pattern: u8) -> String {
         } else {
             i >= 2 && i <= n
         };
-        line.push(if high { '‾' } else { '_' });
+        line.push(if high { '￣' } else { '_' });
     }
     line
 }
@@ -78,7 +78,7 @@ pub struct PopoverData {
     pub reading: String,
     pub pos: Vec<String>,
     pub glosses: Vec<String>,
-    /// Rendered pitch contour with the numeric accent, e.g. `‾_ [1]`.
+    /// Rendered pitch contour with the numeric accent, e.g. `￣_ [1]`.
     pub pitch: Option<String>,
     pub frequency_rank: Option<i64>,
     /// `term ← surface (reason, …)` when a de-inflection was needed.
@@ -305,11 +305,11 @@ mod tests {
 
     #[test]
     fn pitch_contour_matches_the_accent_rules() {
-        assert_eq!(pitch_line("ねこ", 1), "‾_"); // H L
-        assert_eq!(pitch_line("ねこ", 0), "_‾"); // L H (heiban)
-        assert_eq!(pitch_line("がくせい", 0), "_‾‾‾");
-        assert_eq!(pitch_line("がくせい", 2), "_‾__");
-        assert_eq!(pitch_line("あ", 1), "‾");
+        assert_eq!(pitch_line("ねこ", 1), "￣_"); // H L
+        assert_eq!(pitch_line("ねこ", 0), "_￣"); // L H (heiban)
+        assert_eq!(pitch_line("がくせい", 0), "_￣￣￣");
+        assert_eq!(pitch_line("がくせい", 2), "_￣__");
+        assert_eq!(pitch_line("あ", 1), "￣");
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
         };
         let data = PopoverData::from_resolution("読んだ", Some(&resolution));
         assert_eq!(data.term, "読む");
-        assert_eq!(data.pitch.as_deref(), Some("‾_ [1]"));
+        assert_eq!(data.pitch.as_deref(), Some("￣_ [1]"));
         assert_eq!(data.chain.as_deref(), Some("読む ← 読んだ (past)"));
         assert_eq!(data.frequency_rank, Some(420));
     }
