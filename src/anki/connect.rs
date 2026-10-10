@@ -77,6 +77,15 @@ impl AnkiConnect {
         Ok(result)
     }
 
+    /// Ensure the deck exists. `createDeck` is idempotent: an existing deck returns its
+    /// id with no error — which matters because Anki does NOT auto-create decks on
+    /// `addNote` (live-proven 2026-10-10 against flatpak Anki 26.09: the first real
+    /// export failed with "deck was not found: Japanese::Mining").
+    pub async fn create_deck(&self, deck: &str) -> Result<i64, AnkiError> {
+        let result = self.request("createDeck", json!({ "deck": deck })).await?;
+        serde_json::from_value(result).map_err(|err| AnkiError::Malformed(err.to_string()))
+    }
+
     /// List all model (note type) names.
     pub async fn model_names(&self) -> Result<Vec<String>, AnkiError> {
         let result = self.request("modelNames", json!({})).await?;
@@ -91,8 +100,10 @@ impl AnkiConnect {
             return Ok(());
         }
         let front = fields
-            .first()
+            .iter()
+            .find(|name| name.as_str() == "Expression")
             .cloned()
+            .or_else(|| fields.first().cloned())
             .unwrap_or_else(|| "Expression".to_owned());
         let back = fields
             .iter()

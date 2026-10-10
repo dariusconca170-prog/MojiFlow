@@ -324,6 +324,8 @@ async fn export_note(
 ) -> Result<(), AnkiError> {
     let fields: Vec<String> = note.fields.keys().cloned().collect();
     client.ensure_model(&anki.model, &fields).await?;
+    // Decks are NOT auto-created by addNote — ensure it explicitly (idempotent).
+    client.create_deck(&note.deck).await?;
     for file in &note.media {
         client
             .store_media_file(&file.filename, &file.data_base64)

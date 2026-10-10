@@ -398,15 +398,14 @@ fn export_card(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("deck → model").color(DIM));
             ui.label(
-                RichText::new(format!(
-                    "{} → {} ({})",
-                    anki.deck,
-                    anki.model,
-                    anki.tags.join(", ")
-                ))
-                .color(TEXT)
-                .monospace(),
+                RichText::new(format!("{} → {}", anki.deck, anki.model))
+                    .color(TEXT)
+                    .monospace(),
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("tags").color(DIM));
+            ui.label(RichText::new(anki.tags.join(", ")).color(TEXT).monospace());
         });
 
         ui.add_space(6.0);

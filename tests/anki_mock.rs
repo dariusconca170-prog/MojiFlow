@@ -209,6 +209,25 @@ async fn ensure_model_skips_creation_when_model_exists() {
 }
 
 #[tokio::test]
+async fn create_deck_returns_the_deck_id() {
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        json!({ "action": "createDeck", "version": 6, "params": { "deck": "Japanese::Mining" } }),
+        json!(1791636127086_i64),
+    )
+    .await;
+    let client = AnkiConnect::new(&config(server.uri())).expect("client");
+    assert_eq!(
+        client
+            .create_deck("Japanese::Mining")
+            .await
+            .expect("deck id"),
+        1791636127086
+    );
+}
+
+#[tokio::test]
 async fn ensure_model_creates_missing_model_with_card_templates() {
     let server = MockServer::start().await;
     mount_ok(

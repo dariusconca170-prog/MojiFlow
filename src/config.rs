@@ -323,7 +323,10 @@ impl Default for AnkiConfig {
         Self {
             url: "http://127.0.0.1:8765".to_owned(),
             deck: "Japanese::Mining".to_owned(),
-            model: "Japanese Mining".to_owned(),
+            // Namespaced: a bare "Japanese Mining" collides with a popular community
+            // note type with different fields (live-proven 2026-10-10 — addNote then
+            // fails with "cannot create note because it is empty").
+            model: "Japanese Mining (medialingual)".to_owned(),
             tags: vec!["medialingual".to_owned()],
             field_mapping,
             duplicate_scope: "deck".to_owned(),
