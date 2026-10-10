@@ -172,6 +172,8 @@ pub struct App {
     pub toasts: ToastQueue,
     /// Whether the CJK font loaded from the system or the embedded fallback.
     pub font_source: crate::gui::fonts::FontSource,
+    /// Repaint handle for workers built after startup (clock switching).
+    repaint: Arc<RepaintHandle>,
     /// Milestone-1 demo content, shown until a track is loaded and a cue is active.
     pub demo_text: String,
 
@@ -395,6 +397,7 @@ impl App {
             config_issues: issues,
             toasts: ToastQueue::default(),
             font_source,
+            repaint: Arc::clone(&repaint),
             demo_text: "日本語の文をマイニングしよう。漢字・かな・々・ー・〜 すべて表示されます。"
                 .to_owned(),
             track: None,
@@ -749,6 +752,54 @@ impl App {
         !self.ever_started
             && self.track.is_some()
             && self.config.clock.source == ClockSource::Manual
+    }
+
+    /// Switch the clock source live (settings card): shuts the old clock down, builds
+    /// the new one sharing the manual handle, and resets the wait state so the
+    /// overlay's start hint applies to the fresh clock.
+    pub fn switch_clock_source(&mut self, source: ClockSource) {
+        if self.config.clock.source == source {
+            return;
+        }
+        self.config.clock.source = source;
+        self.clock.shutdown();
+        let (clock, fallback) = crate::clock::build_clock(
+            &self.config.clock,
+            self.manual.clone(),
+            self.events_tx.clone(),
+            Arc::clone(&self.repaint),
+        );
+        self.clock = clock;
+        self.ever_started = false;
+        self.active_cue = None;
+        self.last_sync_state = None;
+        if let Some(err) = fallback {
+            self.toasts.push(MlError::Clock(err).to_string(), true);
+        } else {
+            self.toasts
+                .push(format!("clock source: {}", source.label()), false);
+        }
+    }
+
+    /// Persist the live config to disk (settings card). The app otherwise never writes;
+    /// a missing path (pure-default run) is reported, not failed.
+    pub fn save_config(&mut self) {
+        match &self.config_path {
+            Some(path) => match self.config.save(path) {
+                Ok(()) => {
+                    self.toasts.push(format!("saved {}", path.display()), false);
+                }
+                Err(err) => {
+                    self.toasts.push(format!("save failed: {err}"), true);
+                }
+            },
+            None => {
+                self.toasts.push(
+                    "no config file this run (defaults only) — nothing saved".to_owned(),
+                    true,
+                );
+            }
+        }
     }
 
     /// Cache key + prompt parts for explaining the open popover: `(key, sentence, focus)`.
@@ -1307,6 +1358,65 @@ pub fn bottom_center_rect(screen: egui::Rect, size: [f32; 2]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_clock_source_rebuilds_and_resets_wait_state() {
+        use crate::config::ClockSource;
+
+        let mut app = App::new(
+            Config::default(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        assert_eq!(app.config.clock.source, ClockSource::Manual);
+        // Same source: no-op, no toast.
+        app.switch_clock_source(ClockSource::Manual);
+        assert_eq!(app.config.clock.source, ClockSource::Manual);
+
+        // Live switch to mpv: clock rebuilt (IPC thread spawned in background), a toast
+        // announces the change.
+        app.switch_clock_source(ClockSource::MpvIpc);
+        assert_eq!(app.config.clock.source, ClockSource::MpvIpc);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.message.contains("clock source: mpv")),
+            "expected an announce toast"
+        );
+
+        // Switch back: old clock shuts down, ever_started resets so the start hint
+        // applies to the fresh clock.
+        app.switch_clock_source(ClockSource::Manual);
+        assert_eq!(app.config.clock.source, ClockSource::Manual);
+        assert!(!app.ever_started);
+    }
+
+    #[test]
+    fn save_config_persists_live_changes_to_disk() {
+        use crate::config::ClockSource;
+
+        let dir = std::env::temp_dir().join(format!("ml-save-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut app = App::new(
+            Config::default(),
+            Some(path.clone()),
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        app.config.clock.source = ClockSource::Mpris;
+        app.config.subtitle.offset_step_ms = 250;
+        app.save_config();
+        assert!(path.exists(), "config file should be written");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("source = \"mpris\""), "{text}");
+        let parsed: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.clock.source, ClockSource::Mpris);
+        assert_eq!(parsed.subtitle.offset_step_ms, 250);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn bottom_center_rect_is_centered_above_the_bottom_edge() {

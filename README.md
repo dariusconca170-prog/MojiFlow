@@ -10,8 +10,9 @@ entries (definition, reading, pitch accent, frequency) on hover — the fastest 
 > audio/screenshot capture, AnkiConnect export with an offline queue, global hotkeys, the
 > control-room dashboard, and the mining-export pipeline). M8 polish shipped so far:
 > bottom-anchored subtitles, fullscreen-follow, the waiting hint, the local-LLM Explain
-> button, the "start at seconds" clock arm, and this README — with Whisper STT and the
-> settings panel still to come. A user audio review (2026-10-10) also removed the
+> button, the "start at seconds" clock arm, a live settings card (clock source switches
+> without a restart, config persists to disk), and this README — with Whisper STT and a
+> full settings editor still to come. A user audio review (2026-10-10) also removed the
 > yt-dlp grab flow, the dashboard audio card, and the launch-time demo text. See
 > [`PLAN.md`](PLAN.md) for the milestone checklist and status log, and `AGENTS.md` for build
 > notes, architecture, and platform caveats.

@@ -90,6 +90,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 clock_card(app, ui);
                 subtitle_card(app, ui);
                 export_card(app, ui);
+                settings_card(app, ui);
                 hotkeys_card(app, ui);
             });
     });
@@ -250,7 +251,7 @@ fn clock_card(app: &mut App, ui: &mut egui::Ui) {
         } else {
             ui.label(
                 RichText::new(format!(
-                    "'{}' is a live source — steering it arrives with the settings panel (M8)",
+                    "'{}' is a live source (read-only transport) — switch sources in Settings below",
                     source_label(app.config.clock.source)
                 ))
                 .color(DIM),
@@ -414,6 +415,84 @@ fn export_card(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+fn settings_card(app: &mut App, ui: &mut egui::Ui) {
+    use crate::config::ClockSource;
+
+    render_card(ui, "Settings", |ui| {
+        // Clock source with live switching (no restart needed).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("clock source").color(DIM));
+            let mut selected = app.config.clock.source;
+            egui::ComboBox::from_id_salt("clock-source")
+                .selected_text(source_label(selected))
+                .show_ui(ui, |ui| {
+                    for source in ClockSource::ALL {
+                        ui.selectable_value(&mut selected, source, source.label());
+                    }
+                });
+            if selected != app.config.clock.source {
+                app.switch_clock_source(selected);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("offset step").color(DIM));
+            ui.add(
+                egui::DragValue::new(&mut app.config.subtitle.offset_step_ms)
+                    .range(0..=5000)
+                    .suffix(" ms"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("anki url").color(DIM));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.config.anki.url)
+                    .hint_text("http://127.0.0.1:8765")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("explain endpoint").color(DIM));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.config.explain.endpoint)
+                    .hint_text("empty = disabled")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut app.config.window.always_on_top, "always on top");
+            ui.checkbox(
+                &mut app.config.window.follow_fullscreen,
+                "follow fullscreen",
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Save config").strong().color(BG))
+                        .fill(ACCENT)
+                        .corner_radius(6),
+                )
+                .clicked()
+            {
+                app.save_config();
+            }
+            match &app.config_path {
+                Some(path) => ui.label(
+                    RichText::new(path.display().to_string())
+                        .color(DIM)
+                        .size(11.0),
+                ),
+                None => ui.label(
+                    RichText::new("no config file this run")
+                        .color(DIM)
+                        .size(11.0),
+                ),
+            }
+        });
+    });
+}
+
 fn hotkeys_card(app: &mut App, ui: &mut egui::Ui) {
     render_card(ui, "Hotkeys", |ui| {
         egui::Grid::new("hotkeys-global")
@@ -438,12 +517,7 @@ fn hotkeys_card(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn source_label(source: ClockSource) -> &'static str {
-    match source {
-        ClockSource::Manual => "manual",
-        ClockSource::MpvIpc => "mpv",
-        ClockSource::Mpris => "mpris",
-        ClockSource::WhisperLive => "whisper-live",
-    }
+    source.label()
 }
 
 /// Small rounded colored label, optional hover tooltip.

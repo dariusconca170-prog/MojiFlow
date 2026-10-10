@@ -97,6 +97,26 @@ pub enum ClockSource {
     WhisperLive,
 }
 
+impl ClockSource {
+    /// Short UI label (dashboard chips, toasts).
+    pub fn label(self) -> &'static str {
+        match self {
+            ClockSource::Manual => "manual",
+            ClockSource::MpvIpc => "mpv",
+            ClockSource::Mpris => "mpris",
+            ClockSource::WhisperLive => "whisper-live",
+        }
+    }
+
+    /// All variants in UI order, for the settings card selector.
+    pub const ALL: [ClockSource; 4] = [
+        ClockSource::Manual,
+        ClockSource::MpvIpc,
+        ClockSource::Mpris,
+        ClockSource::WhisperLive,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClockConfig {
