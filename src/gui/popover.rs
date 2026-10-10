@@ -158,7 +158,7 @@ impl Line {
     }
 }
 
-fn build_lines(data: &PopoverData) -> Vec<Line> {
+fn build_lines(data: &PopoverData, explanation: Option<&str>) -> Vec<Line> {
     let accent = Color32::from_rgb(120, 200, 255);
     let muted = Color32::from_gray(180);
     let mut lines = vec![Line::new(
@@ -226,7 +226,29 @@ fn build_lines(data: &PopoverData) -> Vec<Line> {
             2.0,
         ));
     }
+    if let Some(explanation) = explanation {
+        lines.push(Line::new(
+            "Explanation:".to_owned(),
+            FontId::proportional(13.0),
+            accent,
+            2.0,
+        ));
+        lines.push(Line::new(
+            explanation.to_owned(),
+            FontId::proportional(14.0),
+            Color32::from_gray(235),
+            2.0,
+        ));
+    }
     lines
+}
+
+/// Whether the popover shows the local-LLM Explain button (and its state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainButton {
+    Hidden,
+    Idle,
+    Busy,
 }
 
 /// Where to place a `width × height` panel relative to `anchor`, kept inside `area`.
@@ -247,11 +269,20 @@ fn place(area: Rect, anchor: Rect, width: f32, height: f32) -> (f32, f32) {
     (x, y)
 }
 
-/// Paint the popover anchored to `anchor` and return the rectangle it occupies (used to
-/// mark it interactive for hit-testing).
-pub fn paint(ui: &mut egui::Ui, data: &PopoverData, anchor: Rect, area: Rect) -> Rect {
+/// Paint the popover anchored to `anchor`. Returns the panel rectangle (for
+/// hit-testing) plus the Explain-button rectangle when `button` is not hidden — the
+/// caller draws the button and handles clicks. `explanation` is a cached local-LLM
+/// answer for this popover, shown as a final section when present.
+pub fn paint(
+    ui: &mut egui::Ui,
+    data: &PopoverData,
+    anchor: Rect,
+    area: Rect,
+    explanation: Option<&str>,
+    button: ExplainButton,
+) -> (Rect, Option<Rect>) {
     let wrap = PANEL_WIDTH - PAD * 2.0;
-    let lines = build_lines(data);
+    let lines = build_lines(data, explanation);
 
     let mut galleys: Vec<(Arc<egui::Galley>, f32)> = Vec::with_capacity(lines.len());
     let mut content_height = 0.0;
@@ -263,7 +294,17 @@ pub fn paint(ui: &mut egui::Ui, data: &PopoverData, anchor: Rect, area: Rect) ->
         galleys.push((galley, line.space));
     }
 
-    let height = content_height + PAD * 2.0;
+    // The Explain button lives inside the panel (bottom row): the pointer path
+    // token → panel → button stays continuously interactive, and the button never
+    // covers subtitle text behind the panel.
+    const BUTTON_HEIGHT: f32 = 26.0;
+    const BUTTON_GAP: f32 = 8.0;
+    let button_reserved = if matches!(button, ExplainButton::Hidden) {
+        0.0
+    } else {
+        BUTTON_HEIGHT + BUTTON_GAP
+    };
+    let height = content_height + PAD * 2.0 + button_reserved;
     let (x, y) = place(area, anchor, PANEL_WIDTH, height);
     let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(PANEL_WIDTH, height));
 
@@ -285,7 +326,15 @@ pub fn paint(ui: &mut egui::Ui, data: &PopoverData, anchor: Rect, area: Rect) ->
         );
         cursor_y += galley.rect.height() + space;
     }
-    rect
+    let button_rect = if matches!(button, ExplainButton::Hidden) {
+        None
+    } else {
+        Some(Rect::from_min_size(
+            Pos2::new(x + PAD, y + height - PAD - BUTTON_HEIGHT),
+            Vec2::new(130.0, BUTTON_HEIGHT),
+        ))
+    };
+    (rect, button_rect)
 }
 
 #[cfg(test)]

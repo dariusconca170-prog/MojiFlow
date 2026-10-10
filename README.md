@@ -8,9 +8,11 @@ entries (definition, reading, pitch accent, frequency) on hover — the fastest 
 > Status: **pre-release, milestone M8 in progress.** Milestones M0–M7 are complete
 > (subtitles + clocks, tokenizer + dictionary, the interactive click-through overlay,
 > audio/screenshot capture, AnkiConnect export with an offline queue, global hotkeys, the
-> control-room dashboard, and the mining-export pipeline). Much of M8's polish is already
-> shipped — the yt-dlp "grab video" flow, bottom-anchored subtitles, fullscreen-follow, and
-> this README — with Whisper STT, the settings panel and a CI workflow still to come. See
+> control-room dashboard, and the mining-export pipeline). M8 polish shipped so far:
+> bottom-anchored subtitles, fullscreen-follow, the waiting hint, the local-LLM Explain
+> button, the "start at seconds" clock arm, and this README — with Whisper STT and the
+> settings panel still to come. A user audio review (2026-10-10) also removed the
+> yt-dlp grab flow, the dashboard audio card, and the launch-time demo text. See
 > [`PLAN.md`](PLAN.md) for the milestone checklist and status log, and `AGENTS.md` for build
 > notes, architecture, and platform caveats.
 
@@ -27,9 +29,11 @@ entries (definition, reading, pitch accent, frequency) on hover — the fastest 
   `window.follow_fullscreen`).
 - **Tokenized subtitles** — SRT / WebVTT / ASS, Shift-JIS and UTF-8 auto-detected. MeCab
   (lindera, embedded IPADIC) splits each line into words with byte offsets.
-- **Dictionary popover** — hover a token for term, reading, pitch accent contour, corpus
-  frequency, part of speech and glosses; conjugated surfaces show their de-inflection chain.
-  Data from JMdict + Kanjium (see `cargo xtask build-dict`).
+- **Dictionary popover + local-LLM Explain** — hover a token for term, reading, pitch
+  accent contour, corpus frequency, part of speech and glosses; conjugated surfaces show
+  their de-inflection chain. When the dictionary has nothing, the ✨ Explain button asks
+  your local LLM (llama.cpp server, OpenAI-compatible) about the line and shows the
+  answer in the popover. Data from JMdict + Kanjium (see `cargo xtask build-dict`).
 - **Playback clocks** — manual hotkeys (a not-yet-started manual clock shows a visible
   "press Ctrl+Alt+Space when it starts" hint), mpv JSON-IPC (the native workflow — play /
   pause / seek / position sync automatically), MPRIS (Linux), and Whisper-live modes.
@@ -42,10 +46,6 @@ entries (definition, reading, pitch accent, frequency) on hover — the fastest 
   opaque window makes it legible: clock source and sync state, the active cue's per-token
   dictionary hits, audio ring fill, the export log, and the configured hotkeys.
   (`Ctrl+Alt+D`).
-- **Grab video (M8)** — paste a stream URL into the dashboard's *Grab video* card and the
-  app shells out to the installed `yt-dlp` (never reimplementing site extraction itself),
-  optionally fetching Japanese subtitles as `.srt`, then opens the result in mpv with the
-  JSON-IPC socket so the overlay follows the download automatically.
 
 ## Building
 
@@ -78,7 +78,7 @@ Configuration lives at `~/.config/medialingual/config.toml`; logs at
 The overlay is at its best on top of **mpv**, which it can fully synchronize with:
 
 ```bash
-sudo apt install mpv yt-dlp ffmpeg
+sudo apt install mpv
 ```
 
 Then set the clock to follow mpv (one line in the config):
@@ -94,11 +94,9 @@ Play the video with the IPC socket open:
 mpv --input-ipc-server=/tmp/mpv-ipc.sock video.mkv     # or: mpv "https://…" (mpv embeds yt-dlp)
 ```
 
-Load a Japanese `.srt` into the overlay (`Ctrl+Alt+O`), and hover/mine as usual. No download
-button on the site? Grab it from the dashboard (`Ctrl+Alt+D` → Grab video): the file lands in
-`~/Videos/Medialingual` (with `ja` subtitles when the site has them) and opens in mpv
-automatically. DRM'd streams can't be downloaded by any tool — for those, the manual clock +
-browser remains the fallback.
+Load a Japanese `.srt` into the overlay (`Ctrl+Alt+O`), and hover/mine as usual.
+Can't download the stream (DRM or no button)? Point the clock at the browser instead —
+`source = "mpris"` follows Brave/Chromium play/pause/position, with `[`/`]` for offset.
 
 ## Development gate
 

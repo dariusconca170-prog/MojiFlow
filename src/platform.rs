@@ -54,6 +54,10 @@ pub fn detect() -> SessionKind {
 /// (`_NET_WM_NAME`), so it must match `main.rs`'s `ViewportBuilder` title exactly.
 pub const OVERLAY_TITLE: &str = "MediaLingual";
 
+/// Title of the control-room dashboard window. The skip-taskbar hint matches on this,
+/// so it must match the dashboard `ViewportBuilder` title exactly.
+pub const DASHBOARD_TITLE: &str = "MojiFlow — Control Room";
+
 impl SessionKind {
     /// Short label for the startup log line and status strip.
     pub fn label(self) -> &'static str {

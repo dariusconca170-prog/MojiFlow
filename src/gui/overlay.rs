@@ -95,7 +95,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         paint_waiting_hint(app, ui, area, layout.origin.y);
     }
 
-    let popover_rect = paint_popover(app, ui, &layout, area);
+    let (popover_rect, explain_rect) = paint_popover(app, ui, &layout, area);
 
     // Interactive rectangles: every token plus the popover (when open). The status strip and
     // the empty overlay remain click-through.
@@ -107,9 +107,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if let Some(rect) = popover_rect {
         interactive.push(rect);
     }
+    // Local-LLM Explain button, reserved inside the panel bottom (user review 2026-10-10).
+    if let Some(button) = explain_rect {
+        let busy = app.explaining.is_some();
+        let label = if busy { "✨ …" } else { "✨ Explain" };
+        if ui
+            .put(button, egui::Button::new(label))
+            .on_hover_text("Ask the local LLM about this line")
+            .clicked()
+            && !busy
+        {
+            app.request_explanation();
+        }
+        interactive.push(button);
+    }
     app.interactive_rects = interactive;
 
-    if app.show_status {
+    if app.show_status && app.track.is_some() {
         paint_status_strip(app, ui, area);
     }
     paint_toasts(app, ui, area);
@@ -336,17 +350,38 @@ fn paint_popover(
     ui: &mut egui::Ui,
     layout: &TokenLayout,
     area: Rect,
-) -> Option<Rect> {
-    let state = app.popover.as_ref()?;
-    let anchor = layout
+) -> (Option<Rect>, Option<Rect>) {
+    let answered = app
+        .explanation_key()
+        .map(|(key, _, _)| key)
+        .is_some_and(|key| app.explanations.contains_key(&key));
+    let key = app.explanation_key().map(|(key, _, _)| key);
+    let explanation = key
+        .as_ref()
+        .and_then(|key| app.explanations.get(key))
+        .map(String::as_str);
+    let button = if answered {
+        popover::ExplainButton::Hidden
+    } else if app.explaining.is_some() {
+        popover::ExplainButton::Busy
+    } else {
+        popover::ExplainButton::Idle
+    };
+    let Some(state) = app.popover.as_ref() else {
+        return (None, None);
+    };
+    let Some(anchor) = layout
         .hits
         .get(state.token_index)
-        .and_then(|hit| hit.rects.first().copied())?;
-    let rect = popover::paint(ui, &state.data, anchor, area);
+        .and_then(|hit| hit.rects.first().copied())
+    else {
+        return (None, None);
+    };
+    let (rect, button_rect) = popover::paint(ui, &state.data, anchor, area, explanation, button);
     if let Some(state) = app.popover.as_mut() {
         state.rect = Some(rect);
     }
-    Some(rect)
+    (Some(rect), button_rect)
 }
 
 fn paint_status_strip(app: &App, ui: &mut egui::Ui, area: Rect) {

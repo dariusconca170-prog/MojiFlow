@@ -41,10 +41,8 @@ These are separate programs with their own licences. The app only executes them;
 licences do not apply to MediaLingual-Native itself, but the user installing them
 accepts those terms from their own distro.
 
-- **yt-dlp** (`src/grab.rs`, dashboard "Grab video") — public domain (The Unlicense).
-  `sudo apt install yt-dlp`.
-- **mpv** (native playback workflow, `MpvIpcClock`, grab auto-open) — GPLv2+.
-- **ffmpeg** (merging `bv*+ba` downloads) — GPL/LGPL depending on the distro build.
+- **mpv** (native playback workflow, `MpvIpcClock`). GPLv2+.
+- **llama.cpp server** (sentence explanations, OpenAI-compatible endpoint). MIT.
 
 ## Rust crates
 

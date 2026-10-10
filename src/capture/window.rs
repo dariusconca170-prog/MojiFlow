@@ -73,6 +73,12 @@ impl GlobalPointer {
         platform_any_fullscreen(self)
     }
 
+    /// Add `_NET_WM_STATE_SKIP_TASKBAR` to the named window so the taskbar shows one
+    /// icon (the overlay) instead of two. Only sends when the state actually differs.
+    pub fn set_skip_taskbar(&self, title: &str) -> Result<(), WindowError> {
+        platform_set_skip_taskbar(self, title)
+    }
+
     /// Primary screen size in physical pixels (X11 root geometry). The app divides by
     /// `pixels_per_point` to get logical points for placement math.
     pub fn primary_screen_size(&self) -> Result<(u32, u32), WindowError> {
@@ -102,32 +108,51 @@ fn platform_any_fullscreen(pointer: &GlobalPointer) -> Result<bool, WindowError>
 
     // Walk the tree like `platform_set_always_on_top` (WM frames reparent the client
     // windows). Skip our own overlay by title: once we put it fullscreen it would
-    // otherwise match itself forever and never restore.
+    // otherwise match itself forever and never restore. Windows that die mid-walk
+    // (BadWindow race, seen live 2026-10-10) are skipped, never fatal.
     let mut queue = vec![root];
     while let Some(w) = queue.pop() {
-        let children = conn
+        let Ok(children) = conn
             .query_tree(w)
-            .map_err(|err| WindowError::X11(err.to_string()))?
-            .reply()
-            .map_err(|err| WindowError::X11(err.to_string()))?
-            .children;
+            .map_err(|err| WindowError::X11(err.to_string()))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|err| WindowError::X11(err.to_string()))
+            })
+            .map(|reply| reply.children)
+        else {
+            continue;
+        };
         for child in children {
-            let name = conn
+            let Ok(name) = conn
                 .get_property(false, child, name_atom, 0u32, 0, 4096)
-                .map_err(|err| WindowError::X11(err.to_string()))?
-                .reply()
-                .map_err(|err| WindowError::X11(err.to_string()))?;
+                .map_err(|err| WindowError::X11(err.to_string()))
+                .and_then(|cookie| {
+                    cookie
+                        .reply()
+                        .map_err(|err| WindowError::X11(err.to_string()))
+                })
+            else {
+                continue;
+            };
             if !name.value.is_empty()
                 && String::from_utf8_lossy(&name.value).trim_end_matches('\0')
                     == crate::platform::OVERLAY_TITLE
             {
                 continue;
             }
-            let state = conn
+            let Ok(state) = conn
                 .get_property(false, child, state_atom, 0u32, 0, 32)
-                .map_err(|err| WindowError::X11(err.to_string()))?
-                .reply()
-                .map_err(|err| WindowError::X11(err.to_string()))?;
+                .map_err(|err| WindowError::X11(err.to_string()))
+                .and_then(|cookie| {
+                    cookie
+                        .reply()
+                        .map_err(|err| WindowError::X11(err.to_string()))
+                })
+            else {
+                continue;
+            };
             if state
                 .value32()
                 .is_some_and(|mut atoms| atoms.any(|atom| atom == full_atom))
@@ -151,6 +176,108 @@ fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError
 fn platform_any_fullscreen(_pointer: &GlobalPointer) -> Result<bool, WindowError> {
     Err(WindowError::Unsupported(
         "fullscreen-follow is X11-only in this build",
+    ))
+}
+
+/// Single taskbar icon (user review 2026-10-10): the dashboard is a top-level WM frame
+/// (direct child of root), so one depth-1 listing + name match suffices — no deep walk.
+/// Windows that die mid-query are skipped like everywhere else in this module.
+#[cfg(target_os = "linux")]
+fn platform_set_skip_taskbar(pointer: &GlobalPointer, title: &str) -> Result<(), WindowError> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ClientMessageData, ClientMessageEvent, ConnectionExt as _};
+
+    let conn = pointer.conn.as_ref().ok_or(WindowError::Unsupported(
+        "no X11 connection for skip-taskbar",
+    ))?;
+    let root = conn.setup().roots[0].root;
+    let intern = |name: &[u8]| -> Result<u32, WindowError> {
+        Ok(conn
+            .intern_atom(false, name)
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .reply()
+            .map_err(|err| WindowError::X11(err.to_string()))?
+            .atom)
+    };
+    let name_atom = intern(b"_NET_WM_NAME")?;
+    let state_atom = intern(b"_NET_WM_STATE")?;
+    let skip_atom = intern(b"_NET_WM_STATE_SKIP_TASKBAR")?;
+
+    let Ok(children) = conn
+        .query_tree(root)
+        .map_err(|err| WindowError::X11(err.to_string()))
+        .and_then(|cookie| {
+            cookie
+                .reply()
+                .map_err(|err| WindowError::X11(err.to_string()))
+        })
+        .map(|reply| reply.children)
+    else {
+        return Ok(());
+    };
+    for child in children {
+        let Ok(property) = conn
+            .get_property(false, child, name_atom, 0u32, 0, 4096)
+            .map_err(|err| WindowError::X11(err.to_string()))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|err| WindowError::X11(err.to_string()))
+            })
+        else {
+            continue;
+        };
+        if property.value.is_empty()
+            || String::from_utf8_lossy(&property.value).trim_end_matches('\0') != title
+        {
+            continue;
+        }
+        let Ok(state) = conn
+            .get_property(false, child, state_atom, 0u32, 0, 32)
+            .map_err(|err| WindowError::X11(err.to_string()))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|err| WindowError::X11(err.to_string()))
+            })
+        else {
+            continue;
+        };
+        if state
+            .value32()
+            .is_some_and(|mut atoms| atoms.any(|atom| atom == skip_atom))
+        {
+            return Ok(()); // already set
+        }
+        let mut bytes = [0u8; 20];
+        for (slot, word) in state_change_data(true, skip_atom).iter().enumerate() {
+            bytes[slot * 4..slot * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let event = ClientMessageEvent::new(32, child, state_atom, ClientMessageData::from(bytes));
+        conn.send_event(
+            false,
+            root,
+            x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_REDIRECT
+                | x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .map_err(|err| WindowError::X11(err.to_string()))?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn platform_set_skip_taskbar(_pointer: &GlobalPointer, _title: &str) -> Result<(), WindowError> {
+    Err(WindowError::Unsupported(
+        "skip-taskbar is X11-only in this build",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_set_skip_taskbar(_pointer: &GlobalPointer, _title: &str) -> Result<(), WindowError> {
+    Err(WindowError::Unsupported(
+        "skip-taskbar is X11-only in this build",
     ))
 }
 
@@ -336,18 +463,32 @@ fn platform_set_always_on_top(
     let mut windows = Vec::new();
     let mut queue = vec![root];
     while let Some(w) = queue.pop() {
-        let children = conn
+        // Windows that die mid-walk (BadWindow race on a busy desktop, seen live
+        // 2026-10-10) are skipped — one dead window must not abort the whole pass.
+        let Ok(children) = conn
             .query_tree(w)
-            .map_err(|err| WindowError::X11(err.to_string()))?
-            .reply()
-            .map_err(|err| WindowError::X11(err.to_string()))?
-            .children;
+            .map_err(|err| WindowError::X11(err.to_string()))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|err| WindowError::X11(err.to_string()))
+            })
+            .map(|reply| reply.children)
+        else {
+            continue;
+        };
         for child in children {
-            let property = conn
+            let Ok(property) = conn
                 .get_property(false, child, name_atom, 0u32, 0, 4096)
-                .map_err(|err| WindowError::X11(err.to_string()))?
-                .reply()
-                .map_err(|err| WindowError::X11(err.to_string()))?;
+                .map_err(|err| WindowError::X11(err.to_string()))
+                .and_then(|cookie| {
+                    cookie
+                        .reply()
+                        .map_err(|err| WindowError::X11(err.to_string()))
+                })
+            else {
+                continue;
+            };
             if !property.value.is_empty()
                 && String::from_utf8_lossy(&property.value).trim_end_matches('\0') == title
             {
@@ -360,11 +501,19 @@ fn platform_set_always_on_top(
 
     let mut changed = false;
     for w in windows {
-        let property = conn
+        // Our own window may have died since the walk (same race) — then there is
+        // nothing to enforce, so skip instead of erroring the whole check.
+        let Ok(property) = conn
             .get_property(false, w, state_atom, 0u32, 0, 32)
-            .map_err(|err| WindowError::X11(err.to_string()))?
-            .reply()
-            .map_err(|err| WindowError::X11(err.to_string()))?;
+            .map_err(|err| WindowError::X11(err.to_string()))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|err| WindowError::X11(err.to_string()))
+            })
+        else {
+            continue;
+        };
         let already = property
             .value32()
             .is_some_and(|mut atoms| atoms.any(|atom| atom == above_atom));

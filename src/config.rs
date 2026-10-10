@@ -20,7 +20,7 @@ pub struct Config {
     pub hotkeys: HotkeysConfig,
     pub audio: AudioConfig,
     pub capture: CaptureConfig,
-    pub grab: GrabConfig,
+    pub explain: ExplainConfig,
     pub stt: SttConfig,
     pub anki: AnkiConfig,
     pub dictionary: DictionaryConfig,
@@ -219,41 +219,6 @@ impl Default for CaptureConfig {
     }
 }
 
-/// "Grab video" (M8): download a stream via the user-installed `yt-dlp` binary.
-///
-/// The app never implements extraction itself — that is yt-dlp's job (thousands of sites,
-/// maintained daily). We only build the argument list, run it off the UI thread, and open
-/// the resulting file in mpv when configured. DRM'd streams cannot be downloaded at all.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GrabConfig {
-    /// Directory the video (and its subtitles) are saved into.
-    pub output_dir: String,
-    /// `yt-dlp -f` selection. The `/b` fallback matters: `bv*+ba` alone *fails* on
-    /// direct-file URLs (a single mp4 has nothing to merge — verified live 2026-10-09),
-    /// while `bv*+ba/b` falls back to the best single file there.
-    pub format: String,
-    /// Subtitle language codes to fetch, comma-separated. Empty = no subtitles.
-    pub sub_langs: String,
-    /// Convert fetched subtitles to `.srt` (what `Ctrl+Alt+O` expects).
-    pub convert_subs: bool,
-    /// Spawn `mpv --input-ipc-server=<socket> <file>` after a successful grab so the
-    /// overlay follows playback automatically (`clock.source = "mpv_ipc"`).
-    pub open_in_mpv: bool,
-}
-
-impl Default for GrabConfig {
-    fn default() -> Self {
-        Self {
-            output_dir: "~/Videos/Medialingual".to_owned(),
-            format: "bv*+ba/b".to_owned(),
-            sub_langs: "ja".to_owned(),
-            convert_subs: true,
-            open_in_mpv: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SttBackend {
@@ -295,6 +260,33 @@ impl Default for SttConfig {
 /// Placeholder → value templates for Anki note fields, e.g.
 /// `"Expression" => "{word}"`, `"Sentence" => "{sentence}"`.
 pub type FieldMapping = BTreeMap<String, String>;
+
+/// Sentence explanations via a local OpenAI-compatible LLM (user review 2026-10-10:
+/// "a button to ask what this part of the sentence is" for words the dictionary does
+/// not cover). Points at a llama.cpp server by default; empty endpoint disables it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExplainConfig {
+    /// Chat-completions URL, e.g. `http://127.0.0.1:8080/v1/chat/completions`.
+    pub endpoint: String,
+    /// Model name; empty = whatever the server has loaded.
+    pub model: String,
+    /// Cap on the answer length.
+    pub max_tokens: u32,
+    /// Request timeout in seconds.
+    pub timeout_s: u64,
+}
+
+impl Default for ExplainConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
+            model: String::new(),
+            max_tokens: 256,
+            timeout_s: 30,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

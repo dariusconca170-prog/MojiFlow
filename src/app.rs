@@ -4,8 +4,7 @@
 //! Workers hold a [`RepaintHandle`] and signal it after posting an event so the UI wakes
 //! up exactly when there is something new (never busy-polling).
 
-use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +42,11 @@ pub enum CoreEvent {
     },
     /// A non-fatal error to surface as a toast.
     Warning(MlError),
+    /// A local-LLM sentence explanation finished (or failed with a message).
+    Explanation {
+        key: String,
+        result: Result<String, String>,
+    },
     /// A fatal-but-recoverable error; the app keeps running, the worker stopped.
     WorkerFailed {
         worker: &'static str,
@@ -98,6 +102,9 @@ pub struct Toast {
 }
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
+/// Errors stay readable longer — a 4 s toast for an X11 failure cannot be read in time
+/// (user review 2026-10-10).
+const ERROR_TOAST_TTL: Duration = Duration::from_secs(12);
 const MAX_TOASTS: usize = 6;
 
 /// Toast queue with TTL expiry.
@@ -119,8 +126,14 @@ impl ToastQueue {
     }
 
     pub fn expire(&mut self, now: Instant) {
-        self.items
-            .retain(|t| now.duration_since(t.created) < TOAST_TTL);
+        self.items.retain(|t| {
+            let ttl = if t.is_error {
+                ERROR_TOAST_TTL
+            } else {
+                TOAST_TTL
+            };
+            now.duration_since(t.created) < ttl
+        });
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Toast> {
@@ -173,7 +186,7 @@ pub struct App {
     /// Control handle for the manual clock (shares state with `clock` when manual).
     pub manual: ManualClock,
     events_rx: crossbeam_channel::Receiver<CoreEvent>,
-    /// Sender half, kept so the grab worker (spawned later) can post results.
+    /// Sender half, kept so on-demand workers (explain) can post results.
     events_tx: crossbeam_channel::Sender<CoreEvent>,
     loader_tx: crossbeam_channel::Sender<UiCommand>,
     /// Workers that must be joined/stopped at exit.
@@ -258,16 +271,13 @@ pub struct App {
     last_fullscreen_check: Instant,
     /// Whether the fullscreen-follow unsupported error was surfaced (once).
     fullscreen_logged: bool,
-    /// yt-dlp grab state shared with the running download thread.
-    pub grab_shared: Arc<crate::grab::GrabShared>,
-    /// Join handle for the active grab thread, if any.
-    grab_thread: Option<std::thread::JoinHandle<()>>,
-    /// `yt-dlp --version` probe result as a display string (None = not probed yet).
-    pub grab_version: Option<String>,
-    /// URL entered in the dashboard grab card.
-    pub grab_url: String,
-    /// Whether the dashboard grab card should also fetch Japanese subtitles.
-    pub grab_with_subs: bool,
+    /// "Start at" seconds typed into the dashboard clock card (user review 2026-10-10:
+    /// "tell it how far into the video I am, then it waits for Space").
+    pub start_at_seconds: String,
+    /// Cached local-LLM explanations by `sentence｜term` key.
+    pub explanations: HashMap<String, String>,
+    /// Key of the in-flight explanation request, if any.
+    pub explaining: Option<String>,
 }
 
 /// Open popover: which token it describes, the display model, and the rectangle it last
@@ -366,21 +376,6 @@ impl App {
         // round trip (and media encoding) never touches the UI thread.
         let export_worker = ExportWorker::spawn(export_events.clone(), Arc::clone(&repaint));
 
-        // Probe the yt-dlp binary off the UI thread (Python startup is ~100 ms); the
-        // first "grab" status line becomes `grab_version` for the dashboard chip.
-        let probe_tx = export_events.clone();
-        std::thread::spawn(move || {
-            let version = crate::grab::probe_version();
-            let _ = probe_tx.send(CoreEvent::Status {
-                component: "grab",
-                text: version
-                    .map(|v| format!("yt-dlp {v} ready"))
-                    .unwrap_or_else(|| {
-                        "yt-dlp not found on PATH (sudo apt install yt-dlp)".to_owned()
-                    }),
-            });
-        });
-
         // Offline queue lives next to the config file; temp dir is the fallback when the
         // config path is unknown (e.g. default config without a persisted location).
         let queue_dir = config_path
@@ -407,7 +402,6 @@ impl App {
             clock,
             manual,
             events_rx,
-            // The grab worker posts results on the same bus the export worker uses.
             events_tx: export_events,
             loader_tx,
             shutdown_hooks: vec![Box::new(move || {
@@ -451,11 +445,9 @@ impl App {
             saved_window_rect: None,
             last_fullscreen_check: Instant::now(),
             fullscreen_logged: false,
-            grab_shared: Arc::new(crate::grab::GrabShared::default()),
-            grab_thread: None,
-            grab_version: None,
-            grab_url: String::new(),
-            grab_with_subs: true,
+            start_at_seconds: String::new(),
+            explanations: HashMap::new(),
+            explaining: None,
         }
     }
 
@@ -497,9 +489,6 @@ impl App {
                 },
                 Ok(CoreEvent::Status { component, text }) => {
                     tracing::info!(component, text = %text, "status");
-                    if component == "grab" && self.grab_version.is_none() {
-                        self.grab_version = Some(text.clone());
-                    }
                     self.status_log.push_back(text.clone());
                     while self.status_log.len() > 6 {
                         self.status_log.pop_front();
@@ -507,6 +496,20 @@ impl App {
                 }
                 Ok(CoreEvent::Warning(err)) => {
                     self.toasts.push(err.to_string(), true);
+                }
+                Ok(CoreEvent::Explanation { key, result }) => {
+                    self.explaining = None;
+                    match result {
+                        Ok(text) => {
+                            if self.explanations.len() > 32 {
+                                self.explanations.clear();
+                            }
+                            self.explanations.insert(key, text);
+                        }
+                        Err(err) => {
+                            self.toasts.push(format!("explain failed: {err}"), true);
+                        }
+                    }
                 }
                 Ok(CoreEvent::WorkerFailed { worker, error }) => {
                     self.toasts.push(format!("{worker} stopped: {error}"), true);
@@ -517,12 +520,13 @@ impl App {
         }
     }
 
-    /// The text currently shown: active cue if any, otherwise the demo string.
+    /// The text currently shown: active cue if any, otherwise nothing. There is
+    /// deliberately no demo text on a fresh launch (user review 2026-10-10: the screen
+    /// must stay clean until subtitles are loaded) — the dashboard explains how.
     pub fn subtitle_text(&self) -> String {
         match (&self.track, self.active_cue) {
             (Some(track), Some(idx)) => track.cue(idx).map(|c| c.text.clone()).unwrap_or_default(),
-            (Some(_), None) => String::new(), // gap between cues
-            (None, _) => self.demo_text.clone(),
+            _ => String::new(),
         }
     }
 
@@ -747,72 +751,49 @@ impl App {
             && self.config.clock.source == ClockSource::Manual
     }
 
-    /// Start a yt-dlp grab from the dashboard card, off the UI thread.
-    pub fn start_grab(&mut self) {
-        if self.grab_shared.running.load(Ordering::SeqCst) {
-            self.toasts.push("grab already running".to_owned(), true);
+    /// Cache key + prompt parts for explaining the open popover: `(key, sentence, focus)`.
+    /// The sentence is the active cue's full text (the token alone loses context).
+    pub fn explanation_key(&self) -> Option<(String, String, String)> {
+        let popover = self.popover.as_ref()?;
+        let term = popover.data.term.clone();
+        let reading = popover.data.reading.clone();
+        let sentence = match (&self.track, self.active_cue) {
+            (Some(track), Some(idx)) => track.cue(idx).map(|c| c.text.clone()),
+            _ => None,
+        }
+        .unwrap_or_else(|| term.clone());
+        let focus = if reading.is_empty() {
+            term.clone()
+        } else {
+            format!("{term} ({reading})")
+        };
+        Some((format!("{sentence}｜{term}"), sentence, focus))
+    }
+
+    /// Ask the local LLM to explain the open popover, off the UI thread. Cached answers
+    /// are reused; at most one request is in flight.
+    pub fn request_explanation(&mut self) {
+        let Some((key, sentence, focus)) = self.explanation_key() else {
+            return;
+        };
+        if self.explanations.contains_key(&key) || self.explaining.is_some() {
             return;
         }
-        let url = self.grab_url.trim().to_owned();
-        if url.is_empty() {
-            self.toasts.push("enter a video URL first".to_owned(), true);
-            return;
-        }
-        let mut config = self.config.grab.clone();
-        if !self.grab_with_subs {
-            config.sub_langs.clear();
-        }
-        let spec = crate::grab::GrabSpec::from_config(&config, url);
-        if let Err(err) = std::fs::create_dir_all(&spec.out_dir) {
+        let Some(req) =
+            crate::explain::ExplainRequest::from_config(&self.config.explain, sentence, focus)
+        else {
             self.toasts.push(
-                format!("cannot create {}: {err}", spec.out_dir.display()),
+                "set [explain] endpoint in config.toml to enable explanations".to_owned(),
                 true,
             );
             return;
-        }
-        let shared = Arc::clone(&self.grab_shared);
-        shared.cancel.store(false, Ordering::SeqCst);
-        // Claim "running" on the UI thread: the worker sets it again, but this closes
-        // the double-click race between spawn and the worker's first store.
-        shared.running.store(true, Ordering::SeqCst);
+        };
+        self.explaining = Some(key.clone());
         let tx = self.events_tx.clone();
-        let open_in_mpv = config.open_in_mpv;
-        let socket = self.config.clock.mpv_socket.clone();
-        let handle = std::thread::spawn(move || {
-            let source = spec.url.clone();
-            let _ = tx.send(CoreEvent::Status {
-                component: "grab",
-                text: format!("grabbing {source}…"),
-            });
-            match crate::grab::run("yt-dlp", &spec, &shared) {
-                Ok(path) => {
-                    let subs = !spec.sub_langs.trim().is_empty();
-                    let _ = tx.send(CoreEvent::Status {
-                        component: "grab",
-                        text: format!(
-                            "saved {}{}",
-                            path.display(),
-                            if subs { " + subs" } else { "" }
-                        ),
-                    });
-                    if open_in_mpv {
-                        if let Err(err) = crate::grab::open_in_mpv(&path, &socket) {
-                            let _ = tx.send(CoreEvent::Status {
-                                component: "grab",
-                                text: err.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(CoreEvent::Status {
-                        component: "grab",
-                        text: format!("grab failed: {err}"),
-                    });
-                }
-            }
+        std::thread::spawn(move || {
+            let result = crate::explain::fetch(&req).map_err(|err| err.to_string());
+            let _ = tx.send(CoreEvent::Explanation { key, result });
         });
-        self.grab_thread = Some(handle);
     }
 
     /// Handle local (overlay-focused) keys for M2: `[`/`]` offset, `Space`
@@ -1141,12 +1122,6 @@ impl App {
 
     /// Ask every worker to stop and join it. Safe to call more than once.
     pub fn shutdown_workers(&mut self) {
-        // Cancel an in-flight yt-dlp grab and join its thread so the app never exits
-        // with a download still running.
-        if let Some(handle) = self.grab_thread.take() {
-            self.grab_shared.cancel.store(true, Ordering::SeqCst);
-            let _ = handle.join();
-        }
         let _ = self.loader_tx.send(UiCommand::Shutdown);
         self.clock.shutdown();
         self.audio = None; // drop joins the capture thread
@@ -1215,6 +1190,15 @@ impl eframe::App for App {
                     self.toasts
                         .push(format!("always-on-top unavailable: {err}"), true);
                 }
+            }
+            // One taskbar icon instead of two (user review 2026-10-10). No-op while the
+            // dashboard is closed; errors stay silent (the overlay hint is the one that
+            // matters, and it already reports).
+            if let Err(err) = self
+                .pointer
+                .set_skip_taskbar(crate::platform::DASHBOARD_TITLE)
+            {
+                tracing::debug!(error = %err, "skip-taskbar unavailable");
             }
         }
 

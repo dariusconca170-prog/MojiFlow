@@ -10,7 +10,6 @@
 //! Transport buttons (start/pause/seek) only drive the manual clock; a live source (mpv,
 //! MPRIS) is read-only this milestone — steering those arrives with the M8 settings panel.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
@@ -53,12 +52,16 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let mut open = true;
     let viewport_id = egui::ViewportId::from_hash_of("mojiflow-dashboard");
     let builder = egui::ViewportBuilder::default()
-        .with_title("MojiFlow — Control Room")
+        .with_title(crate::platform::DASHBOARD_TITLE)
         .with_inner_size(Vec2::new(880.0, 640.0))
         .with_min_inner_size(Vec2::new(560.0, 420.0))
+        .with_transparent(false)
         .with_resizable(true);
 
     ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+        // Opaque root fill first: gaps between cards must never show the desktop
+        // through (user review 2026-10-10).
+        ui.painter().rect_filled(ui.max_rect(), 0.0, BG);
         // Per-viewport dark theme: the overlay's visuals are untouched. egui 0.36 styles
         // are per-`Ui`, so set the style on this viewport's root ui and children inherit.
         let style = ui.style_mut();
@@ -86,9 +89,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 ui.set_width(ui.available_width());
                 clock_card(app, ui);
                 subtitle_card(app, ui);
-                audio_card(app, ui);
                 export_card(app, ui);
-                grab_card(app, ui);
                 hotkeys_card(app, ui);
             });
     });
@@ -224,6 +225,28 @@ fn clock_card(app: &mut App, ui: &mut egui::Ui) {
                     app.manual.seek_by(Duration::from_secs(5), true);
                 }
             });
+            // "Start at": tell the clock how far into the video you are; it seeks there
+            // paused and waits for Space, so subtitles start cleanly mid-video
+            // (user review 2026-10-10).
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("start at").color(DIM));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.start_at_seconds)
+                        .hint_text("83.5 s")
+                        .desired_width(90.0),
+                );
+                if ui.button("Seek").clicked() {
+                    match app.start_at_seconds.trim().parse::<f64>() {
+                        Ok(seconds) if seconds >= 0.0 && seconds.is_finite() => {
+                            app.manual.seek_to(Duration::from_secs_f64(seconds));
+                            app.manual.set_playing(false);
+                        }
+                        _ => {
+                            app.toasts.push("enter seconds, e.g. 83.5".to_owned(), true);
+                        }
+                    }
+                }
+            });
         } else {
             ui.label(
                 RichText::new(format!(
@@ -318,9 +341,8 @@ fn subtitle_card(app: &mut App, ui: &mut egui::Ui) {
                 );
             }
             None => {
-                ui.label(
-                    RichText::new("no active cue — pause/seek the video into a line").color(DIM),
-                );
+                // No nag line: an empty moment between cues is normal, not an error
+                // (user review 2026-10-10).
             }
         }
     });
@@ -352,42 +374,6 @@ fn token_chip(ui: &mut egui::Ui, row: &TokenRow) {
     chip(ui, &row.surface, bg, fg, Some(&tip));
 }
 
-fn audio_card(app: &mut App, ui: &mut egui::Ui) {
-    render_card(ui, "Audio capture (loopback)", |ui| {
-        let Some(audio) = &app.audio else {
-            ui.label(RichText::new("capture thread not running").color(AMBER));
-            return;
-        };
-        let status = audio.status();
-        if status.device.is_empty() {
-            ui.label(RichText::new("starting capture…").color(DIM));
-            return;
-        }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&status.device).color(TEXT).strong());
-            ui.label(RichText::new(format!("@ {} Hz", status.sample_rate)).color(DIM));
-        });
-        // Ring fill: seconds buffered vs configured ring length.
-        if let Some(ring) = audio.ring() {
-            let filled = ring.buffered_seconds();
-            let target = app.config.audio.buffer_seconds.max(0.01);
-            ui.add(
-                egui::ProgressBar::new((filled / target).clamp(0.0, 1.0))
-                    .desired_height(10.0)
-                    .fill(if filled >= target { GREEN } else { ACCENT })
-                    .text(format!("{filled:.1} s / {target:.0} s")),
-            );
-        }
-        if let Some(err) = &status.last_error {
-            ui.label(
-                RichText::new(format!("retrying: {err}"))
-                    .color(AMBER)
-                    .size(11.0),
-            );
-        }
-    });
-}
-
 fn export_card(app: &mut App, ui: &mut egui::Ui) {
     render_card(ui, "Mining export", |ui| {
         let anki = &app.config.anki;
@@ -402,10 +388,6 @@ fn export_card(app: &mut App, ui: &mut egui::Ui) {
                     .color(TEXT)
                     .monospace(),
             );
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("tags").color(DIM));
-            ui.label(RichText::new(anki.tags.join(", ")).color(TEXT).monospace());
         });
 
         ui.add_space(6.0);
@@ -429,49 +411,6 @@ fn export_card(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new(line).color(TEXT).monospace().size(11.0));
             }
         }
-    });
-}
-
-fn grab_card(app: &mut App, ui: &mut egui::Ui) {
-    render_card(ui, "Grab video (yt-dlp)", |ui| {
-        ui.label(
-            RichText::new(
-                "Download a stream when there's no save/download button. The file lands in \
-                 the grab folder and opens in mpv, so the overlay follows playback \
-                 automatically (clock.source = \"mpv_ipc\").",
-            )
-            .color(DIM)
-            .size(11.0),
-        );
-        ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut app.grab_url)
-                .hint_text("https://…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.checkbox(
-            &mut app.grab_with_subs,
-            "also download Japanese subtitles (.srt)",
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let running = app.grab_shared.running.load(Ordering::SeqCst);
-            let clicked = ui
-                .add_enabled(
-                    !running,
-                    egui::Button::new(RichText::new("Grab").strong().color(BG))
-                        .fill(ACCENT)
-                        .corner_radius(6),
-                )
-                .clicked();
-            if clicked {
-                app.start_grab();
-            }
-            match &app.grab_version {
-                Some(line) => ui.label(RichText::new(line).color(TEXT).monospace().size(11.0)),
-                None => ui.label(RichText::new("probing yt-dlp…").color(DIM).size(11.0)),
-            }
-        });
     });
 }
 
