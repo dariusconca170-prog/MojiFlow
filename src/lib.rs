@@ -17,5 +17,6 @@ pub mod export;
 pub mod gui;
 pub mod hotkey;
 pub mod platform;
+pub mod stt;
 pub mod subs;
 pub mod tokenize;

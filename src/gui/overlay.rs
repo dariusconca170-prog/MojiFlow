@@ -123,7 +123,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     app.interactive_rects = interactive;
 
-    if app.show_status && app.track.is_some() {
+    if app.show_status && (app.track.is_some() || app.live_track.is_some()) {
         paint_status_strip(app, ui, area);
     }
     paint_toasts(app, ui, area);

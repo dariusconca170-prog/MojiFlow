@@ -35,6 +35,26 @@ const ACCENTS_URL: &str =
 const NOVELS_FREQ_URL: &str =
     "https://raw.githubusercontent.com/mifunetoshiro/kanjium/master/data/source_files/raw/novels_freq.txt";
 
+/// whisper.cpp ggml models: (size name, file, HF resolve URL). Small is the default:
+/// useful Japanese quality on CPU (~0.5 GB); medium is the GPU-friendly upgrade.
+const WHISPER_MODELS: &[(&str, &str, &str)] = &[
+    (
+        "base",
+        "ggml-base.bin",
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+    ),
+    (
+        "small",
+        "ggml-small.bin",
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+    ),
+    (
+        "medium",
+        "ggml-medium.bin",
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+    ),
+];
+
 const JMDICT_SCHEMA: &str = "
     PRAGMA journal_mode = OFF;
     PRAGMA synchronous = OFF;
@@ -90,12 +110,40 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Download a whisper.cpp ggml STT model into `assets/whisper/` (gitignored).
+    DownloadWhisper {
+        /// Model size: base (74 MB), small (466 MB, default), medium (1.5 GB)
+        #[arg(long, default_value = "small")]
+        model: String,
+        /// Output directory (defaults to `assets/whisper`, matching `[stt] whisper_model_path`)
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::BuildDict { out_dir, force } => build_dict(&out_dir, force),
+        Command::DownloadWhisper { model, out_dir } => download_whisper(&model, out_dir.as_deref()),
     }
+}
+
+/// Download a whisper.cpp model (cached like the dict sources). The overlay's local STT
+/// engine reads `[stt] whisper_model_path` — default `assets/whisper/ggml-small.bin`.
+fn download_whisper(model: &str, out_dir: Option<&Path>) -> Result<()> {
+    let out_dir = out_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("assets/whisper"));
+    let Some((name, file, url)) = WHISPER_MODELS.iter().find(|(m, ..)| *m == model) else {
+        anyhow::bail!("unknown whisper model '{model}' (choose base, small, medium)");
+    };
+    fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    download(url, &out_dir.join(file), false)?;
+    eprintln!(
+        "download-whisper: {name} saved to {}",
+        out_dir.join(file).display()
+    );
+    Ok(())
 }
 
 fn build_dict(out_dir: &Path, force: bool) -> Result<()> {

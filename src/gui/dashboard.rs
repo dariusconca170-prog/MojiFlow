@@ -281,7 +281,7 @@ fn clock_card(app: &mut App, ui: &mut egui::Ui) {
 
 fn subtitle_card(app: &mut App, ui: &mut egui::Ui) {
     render_card(ui, "Subtitle", |ui| {
-        let Some(track) = &app.track else {
+        let Some(track) = app.display_track() else {
             ui.label(
                 RichText::new("no subtitle track — Ctrl+Alt+O or drag a .srt onto the overlay")
                     .color(DIM),

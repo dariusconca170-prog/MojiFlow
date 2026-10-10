@@ -268,11 +268,11 @@ impl Default for SttConfig {
         Self {
             backend: SttBackend::Disabled,
             endpoint: "http://127.0.0.1:8000/v1/audio/transcriptions".to_owned(),
-            model: "whisper-1".to_owned(),
+            model: "small".to_owned(),
             api_key: String::new(),
             language: "ja".to_owned(),
-            vad_threshold: 0.5,
-            whisper_model_path: String::new(),
+            vad_threshold: 0.02,
+            whisper_model_path: "assets/whisper/ggml-small.bin".to_owned(),
         }
     }
 }

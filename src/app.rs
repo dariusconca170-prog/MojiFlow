@@ -47,6 +47,9 @@ pub enum CoreEvent {
         key: String,
         result: Result<String, String>,
     },
+    /// A line transcribed live from the capture audio (whisper-live clock), with
+    /// ring-timeline timestamps in milliseconds.
+    LiveCue { cue: crate::subs::Cue },
     /// A fatal-but-recoverable error; the app keeps running, the worker stopped.
     WorkerFailed {
         worker: &'static str,
@@ -179,6 +182,13 @@ pub struct App {
 
     // --- M2: subtitles + clocks ---
     pub track: Option<SubtitleTrack>,
+    /// Lines transcribed live by the whisper-live clock ("timestamped on arrival").
+    /// An explicitly loaded `track` wins while rendering; this is the no-subtitles path.
+    pub live_track: Option<SubtitleTrack>,
+    /// Guards the one-shot whisper clock build (see `ensure_whisper_clock`): we try once
+    /// per clock-source switch to whisper_live, so a missing model toasts once, never
+    /// every frame.
+    whisper_attempted: bool,
     /// Index of the currently active cue (into `track`).
     pub active_cue: Option<usize>,
     /// User fine offset in ms (`[`/`]`), layered on top of the clock.
@@ -401,6 +411,8 @@ impl App {
             demo_text: "日本語の文をマイニングしよう。漢字・かな・々・ー・〜 すべて表示されます。"
                 .to_owned(),
             track: None,
+            live_track: None,
+            whisper_attempted: false,
             active_cue: None,
             clock,
             manual,
@@ -483,6 +495,8 @@ impl App {
                         );
                         self.track = Some(track);
                         self.active_cue = None;
+                        // A loaded file supersedes live STT lines.
+                        self.live_track = None;
                     }
                     Err(err) => {
                         self.toasts.push(err.to_string(), true);
@@ -514,6 +528,11 @@ impl App {
                         }
                     }
                 }
+                Ok(CoreEvent::LiveCue { cue }) => {
+                    self.live_track
+                        .get_or_insert_with(crate::subs::SubtitleTrack::live)
+                        .push_cue(cue);
+                }
                 Ok(CoreEvent::WorkerFailed { worker, error }) => {
                     self.toasts.push(format!("{worker} stopped: {error}"), true);
                 }
@@ -527,9 +546,19 @@ impl App {
     /// deliberately no demo text on a fresh launch (user review 2026-10-10: the screen
     /// must stay clean until subtitles are loaded) — the dashboard explains how.
     pub fn subtitle_text(&self) -> String {
-        match (&self.track, self.active_cue) {
+        match (self.display_track(), self.active_cue) {
             (Some(track), Some(idx)) => track.cue(idx).map(|c| c.text.clone()).unwrap_or_default(),
             _ => String::new(),
+        }
+    }
+
+    /// The track the overlay renders right now: an explicitly loaded subtitle file wins
+    /// over the live STT lines (whisper-live is the no-subtitles fallback).
+    pub fn display_track(&self) -> Option<&SubtitleTrack> {
+        if self.track.is_some() {
+            self.track.as_ref()
+        } else {
+            self.live_track.as_ref()
         }
     }
 
@@ -740,7 +769,7 @@ impl App {
             self.ever_started = true;
         }
         let effective = clock::effective_time(self.clock.as_ref(), self.user_offset_ms);
-        self.active_cue = match &self.track {
+        self.active_cue = match self.display_track() {
             Some(track) => track.active_at(effective),
             None => None,
         };
@@ -762,6 +791,7 @@ impl App {
             return;
         }
         self.config.clock.source = source;
+        self.whisper_attempted = false; // re-arm the one-shot build on every switch
         self.clock.shutdown();
         let (clock, fallback) = crate::clock::build_clock(
             &self.config.clock,
@@ -779,6 +809,51 @@ impl App {
             self.toasts
                 .push(format!("clock source: {}", source.label()), false);
         }
+        // Whisper-live builds lazily once the capture ring exists — do it immediately
+        // here (audio is up long before the user opens the settings card).
+        if source == ClockSource::WhisperLive {
+            self.ensure_whisper_clock();
+        }
+    }
+
+    /// Build the real whisper-live clock, once, as soon as the capture ring exists (the
+    /// ring only appears after `AudioCapture::start`, which runs after `build_clock`).
+    /// Called every frame; no-ops until the source is whisper_live and audio is up, then
+    /// arms itself so a missing model (or a non-whisper build) toasts exactly once. The
+    /// manual clock keeps the overlay usable meanwhile.
+    #[cfg(feature = "whisper")]
+    pub fn ensure_whisper_clock(&mut self) {
+        if self.config.clock.source != ClockSource::WhisperLive || self.whisper_attempted {
+            return;
+        }
+        let Some(audio) = &self.audio else {
+            return; // capture not up yet; retry next frame
+        };
+        let Some(ring) = audio.ring() else {
+            return;
+        };
+        self.whisper_attempted = true;
+        match crate::clock::whisper_live::WhisperLiveClock::spawn(
+            ring,
+            &self.config.stt,
+            self.events_tx.clone(),
+            Arc::clone(&self.repaint),
+        ) {
+            Ok(clock) => {
+                self.clock = Box::new(clock);
+                self.ever_started = false;
+                self.active_cue = None;
+                self.last_sync_state = None;
+            }
+            Err(err) => {
+                self.toasts.push(format!("whisper-live: {err}"), true);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    pub fn ensure_whisper_clock(&mut self) {
+        // Feature off: `build_clock` already returned a typed clock error at startup.
     }
 
     /// Persist the live config to disk (settings card). The app otherwise never writes;
@@ -808,7 +883,7 @@ impl App {
         let popover = self.popover.as_ref()?;
         let term = popover.data.term.clone();
         let reading = popover.data.reading.clone();
-        let sentence = match (&self.track, self.active_cue) {
+        let sentence = match (self.display_track(), self.active_cue) {
             (Some(track), Some(idx)) => track.cue(idx).map(|c| c.text.clone()),
             _ => None,
         }
@@ -990,7 +1065,7 @@ impl App {
     pub fn refresh_dashboard_tokens(&mut self) {
         let text = match self
             .active_cue
-            .and_then(|index| self.track.as_ref().and_then(|track| track.cue(index)))
+            .and_then(|index| self.display_track().and_then(|track| track.cue(index)))
         {
             Some(cue) => cue.text.clone(),
             None => String::new(),
@@ -1080,7 +1155,7 @@ impl App {
             return false;
         };
         let Some((text, cue_start, cue_end, source_name)) = (|| {
-            let track = self.track.as_ref()?;
+            let track = self.display_track()?;
             let cue = track.cue(index)?;
             let source_name = track
                 .path()
@@ -1205,6 +1280,7 @@ impl eframe::App for App {
 
         self.handle_local_keys(ui);
         self.poll_hotkeys();
+        self.ensure_whisper_clock();
         self.update_timing();
         self.update_cursor(frame, ui.ctx());
 

@@ -49,6 +49,8 @@ pub fn parse(format: Format, text: &str, path: &Path) -> (Vec<Cue>, usize) {
         Format::Srt => parse_srt(text, path),
         Format::WebVtt => parse_vtt(text, path),
         Format::Ass => parse_ass(text, path),
+        // Live tracks are never file-parsed; the arm exists so the match stays total.
+        Format::Live => (Vec::new(), 0),
     }
 }
 

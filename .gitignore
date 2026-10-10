@@ -9,3 +9,6 @@ assets/dict/*.txt
 /key.pub
 /id_*
 *.pem
+
+# Local STT models (downloaded via `cargo xtask download-whisper`)
+assets/whisper/*.bin

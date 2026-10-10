@@ -4,13 +4,17 @@
 //! - [`manual::ManualClock`] — hotkey-driven start/pause/seek.
 //! - [`mpv_ipc::MpvIpcClock`] — frame-accurate sync over mpv's JSON IPC socket.
 //! - [`mpris::MprisClock`] (Linux) — sync over the MPRIS v2.2 D-Bus interface.
-//! - `WhisperLiveClock` — lands in M8; cues are timestamped on arrival.
+//! - [`whisper_live::WhisperLiveClock`] (`whisper` feature) — transcribes the capture
+//!   ring locally (whisper.cpp) and advances by the lines: subtitles timestamped on
+//!   arrival, no subtitle file needed.
 //!
 //! Effective subtitle time is `clock.now() + user_offset`; the offset is applied by `App`.
 
 pub mod manual;
 pub mod mpris;
 pub mod mpv_ipc;
+#[cfg(feature = "whisper")]
+pub mod whisper_live;
 
 use std::time::Duration;
 
@@ -76,13 +80,27 @@ pub fn build_clock(
                 )
             }
         }
-        ClockSource::WhisperLive => (
-            Box::new(manual),
-            Some(ClockError::Unavailable {
-                component: "whisper-live".to_owned(),
-                reason: "live STT clock arrives in milestone M8; using manual clock".to_owned(),
-            }),
-        ),
+        ClockSource::WhisperLive => {
+            #[cfg(feature = "whisper")]
+            {
+                // The real clock builds lazily in `App::ensure_whisper_clock` on the
+                // first frame once the capture ring exists (audio starts after clocks).
+                (Box::new(manual), None)
+            }
+            #[cfg(not(feature = "whisper"))]
+            {
+                let _ = (config, events, repaint);
+                (
+                    Box::new(manual),
+                    Some(ClockError::Unavailable {
+                        component: "whisper-live".to_owned(),
+                        reason:
+                            "live STT needs `cargo build --features whisper`; using manual clock"
+                                .to_owned(),
+                    }),
+                )
+            }
+        }
     }
 }
 

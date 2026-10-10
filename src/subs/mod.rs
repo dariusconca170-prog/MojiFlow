@@ -32,6 +32,8 @@ pub enum Format {
     Srt,
     WebVtt,
     Ass,
+    /// Live-transcribed lines from the whisper-live clock (never file-backed).
+    Live,
 }
 
 impl Format {
@@ -40,6 +42,7 @@ impl Format {
             Format::Srt => "SRT",
             Format::WebVtt => "WebVTT",
             Format::Ass => "ASS/SSA",
+            Format::Live => "Live STT",
         }
     }
 }
@@ -77,6 +80,34 @@ impl SubtitleTrack {
             encoding,
             skipped,
         })
+    }
+
+    /// An empty track that grows via [`SubtitleTrack::push_cue`]: the live STT view for
+    /// the whisper-live clock. Never file-backed and never empty-rejected (it starts
+    /// empty and is only rendered once the first line arrives).
+    pub fn live() -> Self {
+        Self {
+            cues: Vec::new(),
+            path: PathBuf::new(),
+            format: Format::Live,
+            encoding: "(live)".to_owned(),
+            skipped: 0,
+        }
+    }
+
+    /// Append a live-transcribed cue (whisper-live clock). Keeps the vec sorted by start
+    /// (binary-search insert) and re-merges stacked windows; live lines are cheap (one
+    /// per ~2 s of speech) so per-insert merging is fine. Bounded to 2048 lines so an
+    /// all-night session never grows without limit — the oldest half is dropped.
+    pub fn push_cue(&mut self, cue: Cue) {
+        match self.cues.binary_search_by(|c| c.start.cmp(&cue.start)) {
+            Ok(i) => self.cues[i] = cue,
+            Err(i) => self.cues.insert(i, cue),
+        }
+        self.cues = merge_stacked(std::mem::take(&mut self.cues));
+        if self.cues.len() > 2048 {
+            self.cues.drain(0..1024);
+        }
     }
 
     /// Index of the cue active at `t` (start <= t < end), found by binary search in
