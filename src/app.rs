@@ -859,6 +859,18 @@ impl App {
     /// Persist the live config to disk (settings card). The app otherwise never writes;
     /// a missing path (pure-default run) is reported, not failed.
     pub fn save_config(&mut self) {
+        // Never persist a config that fails its own validation (e.g. offset_step_ms
+        // dragged to 0 before the widget clamped at 1): a bad save would toast on
+        // every future launch. The in-memory values stay as-is; only the write is
+        // refused.
+        let mut validator = crate::config::Validator::default();
+        validator.check(&self.config);
+        if !validator.issues.is_empty() {
+            let first = validator.issues[0].to_string();
+            self.toasts
+                .push(format!("not saved, invalid config: {first}"), true);
+            return;
+        }
         match &self.config_path {
             Some(path) => match self.config.save(path) {
                 Ok(()) => {
@@ -905,6 +917,39 @@ impl App {
         if self.explanations.contains_key(&key) || self.explaining.is_some() {
             return;
         }
+        let Some(req) =
+            crate::explain::ExplainRequest::from_config(&self.config.explain, sentence, focus)
+        else {
+            self.toasts.push(
+                "set [explain] endpoint in config.toml to enable explanations".to_owned(),
+                true,
+            );
+            return;
+        };
+        self.explaining = Some(key.clone());
+        let tx = self.events_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::explain::fetch(&req).map_err(|err| err.to_string());
+            let _ = tx.send(CoreEvent::Explanation { key, result });
+        });
+    }
+
+    /// Ask the local LLM to explain an inspector-selected term (dashboard word
+    /// inspector). Same cache/key scheme as [`App::request_explanation`], but driven
+    /// by an explicit sentence + term instead of the overlay popover.
+    pub fn request_explanation_for(&mut self, sentence: String, term: String, reading: String) {
+        if term.is_empty() {
+            return;
+        }
+        let key = format!("{sentence}｜{term}");
+        if self.explanations.contains_key(&key) || self.explaining.is_some() {
+            return;
+        }
+        let focus = if reading.is_empty() {
+            term.clone()
+        } else {
+            format!("{term} ({reading})")
+        };
         let Some(req) =
             crate::explain::ExplainRequest::from_config(&self.config.explain, sentence, focus)
         else {
@@ -1491,6 +1536,25 @@ mod tests {
         let parsed: crate::config::Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.clock.source, ClockSource::Mpris);
         assert_eq!(parsed.subtitle.offset_step_ms, 250);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_config_refuses_invalid_config() {
+        let dir = std::env::temp_dir().join(format!("ml-save-bad-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut app = App::new(
+            Config::default(),
+            Some(path.clone()),
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        // offset_step_ms = 0 fails validation: the write must be refused, leaving no
+        // file behind (previously Save persisted it and every launch toasted).
+        app.config.subtitle.offset_step_ms = 0;
+        app.save_config();
+        assert!(!path.exists(), "invalid config must not be written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
