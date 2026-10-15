@@ -19,6 +19,12 @@ use crate::gui::popover;
 use crate::tokenize::Token;
 
 const MARGIN: f32 = 16.0;
+/// Furigana size relative to the subtitle font size, and the gap between the reading and
+/// the top of the token it annotates.
+const FURIGANA_SCALE: f32 = 0.5;
+const FURIGANA_GAP: f32 = 2.0;
+/// Never shrink a reading below this — unreadable ruby is worse than none.
+const FURIGANA_MIN_SIZE: f32 = 7.0;
 
 /// One token's clickable geometry. `rects` has one entry per text row the token spans.
 pub struct TokenHit {
@@ -88,6 +94,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     paint_token_highlights(app, ui, &layout);
     paint_outlined_text(ui, layout.origin, &layout.galley);
+    if app.config.subtitle.show_furigana {
+        paint_furigana(app, ui, &layout, &tokens);
+    }
 
     // A manual clock that hasn't started yet gets a visible invitation — it was invisible
     // friction that the clock sits paused at zero until Ctrl+Alt+Space.
@@ -191,15 +200,30 @@ fn layout_subtitle(
     })
 }
 
+/// Vertical room the furigana band needs above a line: `0` when the feature is off. The
+/// subtitle is lifted by exactly this much so a reading never lands on the line above it
+/// (or on the video controls).
+pub fn furigana_lift(config: &Config) -> f32 {
+    if config.subtitle.show_furigana {
+        (config.subtitle.font_size * FURIGANA_SCALE).max(FURIGANA_MIN_SIZE) + FURIGANA_GAP
+    } else {
+        0.0
+    }
+}
+
 fn subtitle_position(config: &Config, area: Rect, galley: &Arc<egui::Galley>) -> Pos2 {
     let x = area.center().x - galley.rect.width() / 2.0;
+    // Reserve the ruby band, so it stays inside the window instead of being clipped.
+    let lift = furigana_lift(config);
     let y = match config.subtitle.position.as_str() {
-        "top_center" => area.top() + MARGIN,
+        "top_center" => area.top() + MARGIN + lift,
         "custom" => {
-            area.top() + area.height() * config.subtitle.custom_y - galley.rect.height() / 2.0
+            area.top() + area.height() * config.subtitle.custom_y
+                - galley.rect.height() / 2.0
+                - lift
         }
         // "bottom_center" and anything else validated to it
-        _ => area.bottom() - MARGIN - galley.rect.height(),
+        _ => area.bottom() - MARGIN - galley.rect.height() - lift,
     };
     Pos2::new(x, y)
 }
@@ -271,6 +295,61 @@ fn token_hits(galley: &egui::Galley, origin: Pos2, text: &str, tokens: &[Token])
 /// Character index of a byte offset, or 0 if the offset is not a char boundary.
 fn char_index_at(text: &str, byte: usize) -> usize {
     text.get(..byte).map_or(0, |prefix| prefix.chars().count())
+}
+
+/// Paint each kanji-bearing token's hiragana reading in the band reserved by
+/// [`furigana_lift`], centered over the token it annotates.
+///
+/// A reading is more kana than its surface is kanji (学生 → がくせい), so each one is laid
+/// out and, if it overflows its token, re-laid at a smaller size — otherwise neighbouring
+/// readings collide on a dense line. Readings that would have to shrink past
+/// [`FURIGANA_MIN_SIZE`] are dropped rather than rendered illegibly.
+fn paint_furigana(app: &App, ui: &egui::Ui, layout: &TokenLayout, tokens: &[Token]) {
+    let base_size = (app.config.subtitle.font_size * FURIGANA_SCALE).max(FURIGANA_MIN_SIZE);
+    let color = Color32::from_rgb(226, 232, 240);
+    for hit in &layout.hits {
+        let Some(token) = tokens.get(hit.index) else {
+            continue;
+        };
+        let Some(reading) = crate::furigana::reading_for(&token.surface, &token.reading) else {
+            continue;
+        };
+        let Some(anchor) = hit.rects.first().copied() else {
+            continue;
+        };
+        let mut galley = layout_reading(ui, &reading, base_size);
+        if galley.rect.width() > anchor.width() && galley.rect.width() > 0.0 {
+            let scaled = (base_size * anchor.width() / galley.rect.width()).max(0.0);
+            if scaled < FURIGANA_MIN_SIZE {
+                continue; // illegible — a gap beats a smudge
+            }
+            galley = layout_reading(ui, &reading, scaled);
+        }
+        let pos = Pos2::new(
+            anchor.center().x - galley.rect.width() / 2.0,
+            anchor.top() - galley.rect.height() - FURIGANA_GAP,
+        );
+        // Same offset-outline treatment as the subtitle so the reading survives a bright
+        // frame underneath.
+        for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            ui.painter().galley_with_override_text_color(
+                pos + Vec2::new(dx, dy),
+                Arc::clone(&galley),
+                Color32::BLACK,
+            );
+        }
+        ui.painter().galley(pos, galley, color);
+    }
+}
+
+fn layout_reading(ui: &egui::Ui, reading: &str, size: f32) -> Arc<egui::Galley> {
+    ui.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(
+            reading.to_owned(),
+            FontId::proportional(size),
+            Color32::WHITE,
+        )
+    })
 }
 
 fn paint_backing_box(ui: &mut egui::Ui, area: Rect, galley: &Arc<egui::Galley>) {
@@ -496,6 +575,68 @@ mod tests {
         // Rectangles are monotonic left-to-right for a single unwrapped line.
         let lefts: Vec<f32> = hits.iter().map(|hit| hit.rects[0].left()).collect();
         assert!(lefts.windows(2).all(|pair| pair[0] <= pair[1]), "{lefts:?}");
+    }
+
+    /// The ruby band is only reserved when furigana is on, and it is reserved in every
+    /// placement mode (so a reading is never clipped off the window edge).
+    #[test]
+    fn furigana_lift_is_reserved_only_when_enabled() {
+        let mut config = Config::default();
+        config.subtitle.font_size = 34.0;
+        assert_eq!(
+            furigana_lift(&config),
+            0.0,
+            "off by default: no band, no shift"
+        );
+        config.subtitle.show_furigana = true;
+        let lift = furigana_lift(&config);
+        assert!(lift > 0.0, "the band must be reserved when enabled");
+        assert_eq!(lift, 34.0 * FURIGANA_SCALE + FURIGANA_GAP);
+    }
+
+    /// Headless render test for `subtitle.show_furigana`: with the setting on, the kanji
+    /// tokens produce reading glyphs; with it off, the very same layout produces none.
+    #[test]
+    fn furigana_paints_reading_glyphs_only_when_enabled() {
+        let ctx = egui::Context::default();
+        let _ = crate::gui::fonts::install_cjk_fonts(&ctx);
+        let text = "私は学生です。";
+        let tokens = JapaneseTokenizer::new()
+            .expect("tokenizer")
+            .tokenize(text)
+            .expect("tokenize");
+
+        // Two apps differing only in the flag, so the assertion covers the exact condition
+        // `show()` uses to decide whether to paint the band.
+        let make_app = |show: bool| {
+            let mut config = Config::default();
+            config.subtitle.show_furigana = show;
+            crate::app::App::new(
+                config,
+                None,
+                Vec::new(),
+                crate::gui::fonts::FontSource::Embedded,
+                ctx.clone(),
+            )
+        };
+        let paint = |app: &crate::app::App| -> usize {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let area = ui.max_rect();
+                let layout = build_layout(&app.config, ui, area, text, &tokens);
+                if app.config.subtitle.show_furigana {
+                    paint_furigana(app, ui, &layout, &tokens);
+                }
+            });
+            output.textures_delta.clear();
+            output.shapes.len()
+        };
+
+        let off = paint(&make_app(false));
+        let on = paint(&make_app(true));
+        assert!(on > off, "furigana must add glyphs ({on} vs {off})");
+        // 私 and 学生 are the two annotated words, each painted once per outline offset
+        // plus the fill — anything less means a reading went missing.
+        assert!(on - off >= 10, "expected readings for both kanji words");
     }
 
     /// Headless render test: the waiting hint must shape and paint real primitives

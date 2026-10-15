@@ -14,6 +14,7 @@ pub mod dict;
 pub mod error;
 pub mod explain;
 pub mod export;
+pub mod furigana;
 pub mod gui;
 pub mod hotkey;
 pub mod platform;

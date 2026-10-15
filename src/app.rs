@@ -1285,7 +1285,9 @@ impl App {
             &surface,
             resolution.as_ref(),
             &text,
-            "",
+            // `{sentence_furigana}` used to be hardcoded empty, so the mapped field could
+            // never carry anything. Same tokenizer output the overlay shows.
+            &crate::furigana::sentence_furigana(tokens.as_slice()),
             cue_start.as_secs_f64(),
             &source_name,
         );
