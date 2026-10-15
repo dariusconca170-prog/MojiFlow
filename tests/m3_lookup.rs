@@ -54,6 +54,37 @@ fn open_dictionary() -> Option<Dictionary> {
     Some(Dictionary::open(&config).expect("databases open"))
 }
 
+/// Real-database regression for the de-inflection rule table. These surfaces either
+/// resolved to the wrong lemma or to nothing at all before the rules were fixed:
+/// 行った fell through to the homograph 行う (おこなう), and 〜たら had no rule, so
+/// 行ったら/読んだら produced no usable candidate.
+#[test]
+fn conjugations_resolve_to_the_right_lemma_against_the_real_database() {
+    let Some(mut dict) = open_dictionary() else {
+        return;
+    };
+    for (surface, expected) in [
+        ("行った", "行く"),
+        ("行って", "行く"),
+        ("行ったら", "行く"),
+        ("いった", "いく"),
+        ("買ったら", "買う"),
+        ("読んだら", "読む"),
+        ("書いたら", "書く"),
+        ("食べたら", "食べる"),
+    ] {
+        let resolution = dict
+            .resolve_detailed(surface)
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{surface} resolved to nothing"));
+        assert_eq!(
+            resolution.candidate.term, expected,
+            "{surface} must de-inflect to {expected}, got {:?} via {:?}",
+            resolution.candidate.term, resolution.candidate.reasons
+        );
+    }
+}
+
 #[test]
 fn twenty_two_sentences_resolve_through_the_dictionary() {
     let Some(mut dict) = open_dictionary() else {

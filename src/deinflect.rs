@@ -89,6 +89,29 @@ fn build_rules() -> Vec<Rule> {
         }
     };
 
+    // ---- 行く, the one godan verb that breaks the く column --------------------
+    // Every other く-verb takes イ音便 (書く → 書いて/書いた); 行く alone takes
+    // 促音便 (行って/行った). Without these rules `行った` fell through to the generic
+    // `った` → `う` rewrite and resolved to the homograph 行う (おこなう, "to perform") —
+    // wrong for the far more common 行く. Pushed FIRST so the candidate order prefers it.
+    for (from, to) in [
+        ("行って", "行く"),
+        ("行った", "行く"),
+        ("いって", "いく"),
+        ("いった", "いく"),
+    ] {
+        push(from, to, "irregular 促音便");
+    }
+
+    // ---- たら / だら: the past conditional ------------------------------------
+    // `〜したら` is everywhere in dialogue and had NO rule, so these surfaces produced no
+    // candidates at all. Rewriting the tail to the plain た-form (rather than deleting it)
+    // hands the work to the existing rules: 買ったら → 買った → 買う, 書いたら → 書いた →
+    // 書く, 食べたら → 食べた → 食べる, 行ったら → 行った → 行く. Note 促音便 verbs need
+    // `たら` → `た` (not `ったら` → `う`): the stem is already fused into the た-form.
+    push("たら", "た", "conditional (past)");
+    push("だら", "だ", "conditional (past)");
+
     // ---- godan verbs, generated per kana column ----------------------------
     for (a, i, e, o, dict) in GODAN_COLUMNS {
         let (te, ta) = match TE_TA.iter().find(|(end, _, _)| *end == dict) {
@@ -278,6 +301,44 @@ mod tests {
                 panic!("expected candidate {expected:?} for {surface:?}; got {terms:?}")
             })
             .clone()
+    }
+
+    // --- irregulars ---------------------------------------------------------
+
+    /// 行く is the single godan verb with 促音便, and 行った/行って also spell the
+    /// homograph 行う (おこなう). The wrong lemma used to win because the generic
+    /// `った` → `う` rewrite came first.
+    #[test]
+    fn godan_iku_takes_tsu_onbin_and_wins_the_homograph() {
+        deinflects_to("行った", "行く");
+        deinflects_to("行って", "行く");
+        deinflects_to("いった", "いく");
+        deinflects_to("行きます", "行く");
+
+        let candidates = deinflect("行った");
+        let terms: Vec<&str> = candidates.iter().map(|c| c.term.as_str()).collect();
+        let iku = terms
+            .iter()
+            .position(|t| *t == "行く")
+            .expect("行く candidate");
+        let okonau = terms
+            .iter()
+            .position(|t| *t == "行う")
+            .expect("行う candidate");
+        assert!(
+            iku < okonau,
+            "行く is far more frequent than the homograph 行う: {terms:?}"
+        );
+    }
+
+    /// `〜したら` had no rule at all, so these surfaces resolved to nothing.
+    #[test]
+    fn past_conditional_reaches_the_dictionary_form() {
+        deinflects_to("行ったら", "行く");
+        deinflects_to("読んだら", "読む");
+        deinflects_to("食べたら", "食べる");
+        deinflects_to("書いたら", "書く");
+        deinflects_to("したら", "する");
     }
 
     // --- ichidan (Group II) --------------------------------------------------
