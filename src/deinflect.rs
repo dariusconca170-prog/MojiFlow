@@ -49,8 +49,12 @@ impl Rule {
 }
 
 /// Godan columns: (a-row, i-row, e-row, o-row, dictionary row).
+///
+/// The う column's a-row is **わ**, not あ: 五段 verbs ending in う use わ for the 未然形
+/// (買わない, 買われる, 買わせる, 買わず). With あ the generated 買あない/買あれる rules matched
+/// nothing at all, so *every* う-verb negative, passive and causative failed to resolve.
 const GODAN_COLUMNS: [(&str, &str, &str, &str, &str); 9] = [
-    ("あ", "い", "え", "お", "う"),
+    ("わ", "い", "え", "お", "う"),
     ("か", "き", "け", "こ", "く"),
     ("が", "ぎ", "げ", "ご", "ぐ"),
     ("さ", "し", "せ", "そ", "す"),
@@ -133,13 +137,22 @@ fn build_rules() -> Vec<Rule> {
         push(&format!("{te}います"), dict, "progressive polite");
         push(&format!("{te}る"), dict, "short progressive");
         push(&format!("{ta}り"), dict, "consecutive");
-        // E-row: potential / conditional
+        // E-row: potential / conditional / imperative
         push(&format!("{e}る"), dict, "potential");
-        push(&format!("{e}れば"), dict, "conditional");
+        // Conditional: the 仮定形 is the e-row plus `ば` (書けば, 買えば, 読めば).
+        // `{e}れば` is the conditional of the *potential* (書ければ = if one can write) —
+        // it was the only one present, so the plain conditional matched nothing.
+        push(&format!("{e}ば"), dict, "conditional");
+        push(&format!("{e}れば"), dict, "potential conditional");
+        // Bare e-row kana is the imperative (書け, 読め, 話せ, 買え, 行け). Broad by design:
+        // the surface itself is always candidate #1, so a real noun like 助け still wins,
+        // and anything else is validated against the dictionary.
+        push(e, dict, "imperative");
         // A-row: negative, passive, causative
         push(&format!("{a}ない"), dict, "negative");
         push(&format!("{a}なかった"), dict, "negative past");
         push(&format!("{a}なかったら"), dict, "negative conditional");
+        push(&format!("{a}ず"), dict, "negative (-ず)");
         push(&format!("{a}れる"), dict, "passive");
         push(&format!("{a}せる"), dict, "causative");
         push(&format!("{a}される"), dict, "causative-passive");
@@ -168,6 +181,10 @@ fn build_rules() -> Vec<Rule> {
         ("させる", "causative"),
         ("させられる", "causative-passive"),
         ("たい", "desire"),
+        ("よう", "volitional"),
+        ("ろ", "imperative"),
+        ("なくて", "negative -te"),
+        ("ないで", "negative -te"),
     ] {
         push(from, "る", reason);
     }
@@ -191,6 +208,8 @@ fn build_rules() -> Vec<Rule> {
         ("される", "passive"),
         ("させる", "causative"),
         ("させられる", "causative-passive"),
+        ("せず", "negative (-ず)"),
+        ("しろ", "imperative"),
         ("し", "stem"),
     ] {
         push(from, "する", reason);
@@ -211,11 +230,16 @@ fn build_rules() -> Vec<Rule> {
         ("こよう", "volitional"),
         ("こられる", "potential/passive"),
         ("こさせる", "causative"),
+        ("こい", "imperative"),
+        ("こず", "negative (-ず)"),
         ("きている", "progressive"),
         ("きていた", "progressive past"),
     ] {
         push(from, "くる", reason);
     }
+    // 来る imperative in kana-initial form (来い → 来る); the other kanji spellings are
+    // covered by the uniform ichidan rules.
+    push("来い", "来る", "imperative");
 
     // ---- い-adjectives ------------------------------------------------------
     for (from, reason) in [

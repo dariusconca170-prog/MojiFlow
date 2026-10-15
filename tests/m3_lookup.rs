@@ -85,6 +85,105 @@ fn conjugations_resolve_to_the_right_lemma_against_the_real_database() {
     }
 }
 
+/// Sweep of common real-world conjugations through the real database, so a gap in the
+/// de-inflection rule table (or a wrong a-row / conditional) fails loudly instead of
+/// quietly returning nothing. Found four separate table bugs when first run.
+#[test]
+fn common_conjugations_resolve_against_the_real_database() {
+    let Some(mut dict) = open_dictionary() else {
+        return;
+    };
+    let cases: &[(&str, &str)] = &[
+        ("買った", "買う"),
+        ("買います", "買う"),
+        ("買わない", "買う"),
+        ("買わなかった", "買う"),
+        ("買える", "買う"),
+        ("買えば", "買う"),
+        ("買おう", "買う"),
+        ("買われる", "買う"),
+        ("買わせる", "買う"),
+        ("買いたい", "買う"),
+        ("買え", "買う"),
+        ("買わず", "買う"),
+        ("書いた", "書く"),
+        ("書け", "書く"),
+        ("書かない", "書く"),
+        ("書こう", "書く"),
+        ("書かず", "書く"),
+        ("読んだ", "読む"),
+        ("読め", "読む"),
+        ("読まない", "読む"),
+        ("話した", "話す"),
+        ("話せ", "話す"),
+        ("話さない", "話す"),
+        ("待て", "待つ"),
+        ("死んだ", "死ぬ"),
+        ("遊べ", "遊ぶ"),
+        ("泳いだ", "泳ぐ"),
+        ("泳げ", "泳ぐ"),
+        ("食べた", "食べる"),
+        ("食べない", "食べる"),
+        ("食べよう", "食べる"),
+        ("食べろ", "食べる"),
+        ("食べなくて", "食べる"),
+        ("来ない", "来る"),
+        ("行った", "行く"),
+        ("行け", "行く"),
+        ("行かず", "行く"),
+    ];
+    let mut misses = Vec::new();
+    for (surface, expected) in cases {
+        let got = dict
+            .resolve_detailed(surface)
+            .expect("lookup")
+            .map(|r| r.candidate.term);
+        if got.as_deref() != Some(expected) {
+            misses.push(format!("{surface} -> {got:?} (want {expected})"));
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "{} of {} conjugations failed to reach their dictionary form: {misses:#?}",
+        misses.len(),
+        cases.len()
+    );
+}
+
+/// Surfaces that are *themselves* JMdict entries, so candidate #1 (the unmodified surface)
+/// wins by the documented design: した = 下, しない = 竹刀, しよう = 使用, しろ = 白, and
+/// 待った / 死ね / 来い / 来た are listed as their own entries. 遊んだ picks the variant
+/// spelling 遊む over 遊ぶ — preferring a spelling would need corpus frequency at
+/// resolution time (known limitation, not a rule gap).
+///
+/// Pinned rather than ignored: if any of these ever stops resolving, something changed.
+#[test]
+fn homograph_surfaces_still_resolve_to_something() {
+    let Some(mut dict) = open_dictionary() else {
+        return;
+    };
+    for surface in [
+        "待った",
+        "死ね",
+        "遊んだ",
+        "した",
+        "しない",
+        "しよう",
+        "しろ",
+        "来た",
+        "来い",
+    ] {
+        let resolution = dict
+            .resolve_detailed(surface)
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{surface} stopped resolving entirely"));
+        assert!(
+            !resolution.entries.is_empty(),
+            "{surface} resolved to a lemma with no entries"
+        );
+    }
+}
+
 #[test]
 fn twenty_two_sentences_resolve_through_the_dictionary() {
     let Some(mut dict) = open_dictionary() else {
