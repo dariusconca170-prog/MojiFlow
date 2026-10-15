@@ -237,7 +237,12 @@ async fn observe_connection(
             }
             message = props.try_next() => {
                 let Some(message) = message? else { return Ok(()) };
-                handle_properties(message, shared, events, repaint);
+                if handle_properties(message, shared, events, repaint) {
+                    // The signal says playback may have moved (seek, pause/resume, track
+                    // change) but carries no position, so read it now — otherwise a seek
+                    // in the player leaves the overlay desynced until the player changes.
+                    refresh_position(conn, shared, events, repaint).await;
+                }
             }
             message = names.try_next() => {
                 let Some(message) = message? else { return Ok(()) };
@@ -248,22 +253,24 @@ async fn observe_connection(
 }
 
 /// A player sent a `PropertiesChanged` for its `org.mpris.MediaPlayer2.Player` interface.
+///
+/// Returns `true` when the position may have moved and should be re-read from the player.
 fn handle_properties(
     message: zbus::Message,
     shared: &Arc<Mutex<Shared>>,
     events: &crossbeam_channel::Sender<CoreEvent>,
     repaint: &Arc<RepaintHandle>,
-) {
+) -> bool {
     let sender = message.header().sender().map(|name| name.to_string());
-    let Ok((interface, changed, _invalidated)) = message.body().deserialize::<(
+    let Ok((interface, changed, invalidated)) = message.body().deserialize::<(
         String,
         HashMap<String, zbus::zvariant::OwnedValue>,
         Vec<String>,
     )>() else {
-        return;
+        return false;
     };
     if interface != "org.mpris.MediaPlayer2.Player" {
-        return;
+        return false;
     }
     let status = changed
         .get("PlaybackStatus")
@@ -282,7 +289,7 @@ fn handle_properties(
             .as_ref()
             .is_none_or(|player| player == sender.as_deref().unwrap_or(""));
     if !ours {
-        return;
+        return false;
     }
     guard.connected = true;
     guard.stale_reason = None;
@@ -295,6 +302,21 @@ fn handle_properties(
         });
     }
     repaint.request_after(REPAINT_INTERVAL);
+    let keys: Vec<&str> = changed.keys().map(String::as_str).collect();
+    signal_moves_position(&keys, &invalidated)
+}
+
+/// True when a `PropertiesChanged` signal can have moved the playback position.
+///
+/// `Position` is normally *not* in this list: MPRIS v2.2 forbids players from including
+/// it in the signal, so a seek arrives as an invalidation instead. It is accepted in
+/// `changed_keys` too for the players that send it anyway. `Metadata` covers a track
+/// change, which restarts playback at zero while `PlaybackStatus` stays `Playing`.
+fn signal_moves_position(changed_keys: &[&str], invalidated: &[String]) -> bool {
+    changed_keys
+        .iter()
+        .any(|key| matches!(*key, "PlaybackStatus" | "Metadata" | "Position"))
+        || invalidated.iter().any(|key| key == "Position")
 }
 
 /// A player service appeared or vanished. Rescan and possibly re-home the clock.
@@ -388,17 +410,64 @@ async fn scan_players(
     }
 }
 
-async fn query_player(conn: &zbus::Connection, service: &str) -> zbus::Result<(Duration, bool)> {
-    let proxy = match MprisPlayerProxy::new(conn, service).await {
-        Ok(proxy) => proxy,
-        Err(err) => return Err(err),
+/// Read a player's position and status.
+///
+/// The position is **optional**: not every player implements the `Position` getter, and
+/// the spec allows it to be absent. An unknown position must stay unknown — defaulting it
+/// to zero snapped the overlay back to the first line of the file mid-playback.
+/// `PlaybackStatus` is mandatory, so a failure to read it is a real error and is reported
+/// as such instead of silently reading as "paused".
+async fn query_player(
+    conn: &zbus::Connection,
+    service: &str,
+) -> zbus::Result<(Option<Duration>, bool)> {
+    let proxy = MprisPlayerProxy::new(conn, service).await?;
+    let position = proxy
+        .position()
+        .await
+        .ok()
+        .filter(|micros| *micros >= 0)
+        .map(|micros| Duration::from_micros(micros as u64));
+    let status = proxy.playback_status().await?;
+    Ok((position, status == "Playing"))
+}
+
+/// Re-read the player's position after a signal that may have moved it. A failed or
+/// negative read is ignored (the clock keeps extrapolating) rather than treated as zero.
+async fn refresh_position(
+    conn: &zbus::Connection,
+    shared: &Arc<Mutex<Shared>>,
+    events: &crossbeam_channel::Sender<CoreEvent>,
+    repaint: &Arc<RepaintHandle>,
+) {
+    let service = {
+        let guard = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.player.clone()
     };
-    let position = proxy.position().await.unwrap_or(0);
-    let status = proxy.playback_status().await.unwrap_or_default();
-    Ok((
-        Duration::from_micros(position.max(0) as u64),
-        status == "Playing",
-    ))
+    let Some(service) = service else { return };
+    let Ok(proxy) = MprisPlayerProxy::new(conn, service.as_str()).await else {
+        return;
+    };
+    let Ok(position_us) = proxy.position().await else {
+        return;
+    };
+    if position_us < 0 {
+        return;
+    }
+    {
+        let mut guard = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.position = Duration::from_micros(position_us as u64);
+        guard.updated = Instant::now();
+    }
+    repaint.request_after(REPAINT_INTERVAL);
+    let _ = events.send(CoreEvent::Status {
+        component: "clock",
+        text: "mpris: re-synced player position".to_owned(),
+    });
 }
 
 /// Apply one player state update. Pure so it is unit-testable without a bus.
@@ -431,7 +500,7 @@ fn set_live(
     events: &crossbeam_channel::Sender<CoreEvent>,
     repaint: &Arc<RepaintHandle>,
     player: String,
-    position: Duration,
+    position: Option<Duration>,
     playing: bool,
 ) {
     {
@@ -441,8 +510,18 @@ fn set_live(
         guard.connected = true;
         guard.stale_reason = None;
         guard.player = Some(player.clone());
-        guard.position = position;
-        guard.updated = Instant::now();
+        match position {
+            Some(position) => {
+                guard.position = position;
+                guard.updated = Instant::now();
+            }
+            // Unknown position: keep whatever we had and rebase at the transition, so
+            // switching to playing never extrapolates from a stale timestamp.
+            None => {
+                guard.position = guard.extrapolated();
+                guard.updated = Instant::now();
+            }
+        }
         guard.playing = playing;
     }
     let _ = events.send(CoreEvent::Status {
@@ -498,6 +577,68 @@ mod tests {
         let mut shared = fresh();
         apply_properties(&mut shared, None, Some(-5));
         assert_eq!(shared.position, Duration::ZERO);
+    }
+
+    #[test]
+    fn seeks_and_track_changes_trigger_a_position_refresh() {
+        // A seek arrives as an invalidation, not as a value (MPRIS forbids putting
+        // Position in the signal), so without this a seek never re-synced the overlay.
+        assert!(signal_moves_position(&[], &["Position".to_owned()]));
+        assert!(signal_moves_position(&["PlaybackStatus"], &[]));
+        // A track change restarts playback at zero while the status stays "Playing".
+        assert!(signal_moves_position(&["Metadata"], &[]));
+        // Players that send the value anyway are handled too.
+        assert!(signal_moves_position(&["Position"], &[]));
+        // Unrelated chatter must not cost a D-Bus round trip.
+        assert!(!signal_moves_position(&["Volume", "LoopStatus"], &[]));
+        assert!(!signal_moves_position(&[], &["Metadata".to_owned()]));
+    }
+
+    #[test]
+    fn unknown_position_keeps_the_clock_instead_of_resetting_it() {
+        // A player that does not implement the Position getter used to read as 0 s, which
+        // snapped the overlay back to the first line of the file mid-playback.
+        let shared = Arc::new(Mutex::new(fresh()));
+        let (events, _rx) = crossbeam_channel::bounded(4);
+        let repaint = Arc::new(RepaintHandle::for_tests());
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.position = Duration::from_secs(90);
+            guard.playing = true;
+        }
+        set_live(
+            &shared,
+            &events,
+            &repaint,
+            "org.mpris.MediaPlayer2.unknown".to_owned(),
+            None,
+            true,
+        );
+        // The guard is scoped (a `Mutex` is not reentrant and `set_live` locks it too).
+        {
+            let guard = shared.lock().unwrap();
+            assert!(
+                guard.position >= Duration::from_secs(90),
+                "position was reset: {:?}",
+                guard.position
+            );
+            assert!(guard.connected && guard.playing);
+        }
+
+        // A reported position still wins.
+        set_live(
+            &shared,
+            &events,
+            &repaint,
+            "org.mpris.MediaPlayer2.known".to_owned(),
+            Some(Duration::from_secs(5)),
+            false,
+        );
+        {
+            let guard = shared.lock().unwrap();
+            assert_eq!(guard.position, Duration::from_secs(5));
+            assert!(!guard.playing);
+        }
     }
 
     #[test]
