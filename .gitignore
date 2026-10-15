@@ -12,3 +12,6 @@ assets/dict/*.txt
 
 # Local STT models (downloaded via `cargo xtask download-whisper`)
 assets/whisper/*.bin
+
+# Headless QA screenshots (Xvfb captures; never committed)
+/qa-shots/

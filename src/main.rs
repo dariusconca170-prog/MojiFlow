@@ -89,7 +89,53 @@ fn log_session_type() {
     medialingual_native::platform::log_session(session);
 }
 
+const USAGE: &str = "\
+medialingual-native [--subtitle <file>]
+
+  --subtitle, -s <file>   load this subtitle file at startup (srt/vtt/ass/ssa/sub)
+  --help, -h              print this help and exit
+
+Without `--subtitle` the overlay starts empty: load a file with Ctrl+Alt+O, by dragging it
+onto the overlay, or from the dashboard.";
+
+/// Parse the command line: `Ok(Some(path))` to preload a subtitle file, `Ok(None)` for none.
+/// `Err(message)` is a usage error (unknown flag, missing argument) the caller reports.
+/// Pure so the flag handling is unit-testable without launching a window.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Option<PathBuf>, String> {
+    let mut args = args.into_iter();
+    let mut preload = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--subtitle" | "-s" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("'{arg}' needs a file path"))?;
+                if value.trim().is_empty() {
+                    return Err(format!("'{arg}' needs a file path"));
+                }
+                preload = Some(PathBuf::from(value));
+            }
+            "--help" | "-h" => return Err(String::new()),
+            other => return Err(format!("unrecognised argument '{other}'")),
+        }
+    }
+    Ok(preload)
+}
+
 fn main() -> anyhow::Result<()> {
+    let preload = match parse_args(std::env::args().skip(1)) {
+        Ok(preload) => preload,
+        Err(message) => {
+            // An empty message is the explicit `--help` request, which is not an error.
+            if message.is_empty() {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            eprintln!("medialingual: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
     let config_path = Config::default_path();
     let log_path = config_path
         .as_ref()
@@ -177,9 +223,51 @@ fn main() -> anyhow::Result<()> {
                 font_source,
                 cc.egui_ctx.clone(),
             );
+            if let Some(path) = preload {
+                // The loader runs off the UI thread, so this only queues the work.
+                if !app.load_subtitle_file(path.clone()) {
+                    tracing::error!(path = %path.display(), "subtitle loader unavailable");
+                } else {
+                    tracing::info!(path = %path.display(), "preloading subtitle file");
+                }
+            }
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     );
     // eframe::Error is not std::error::Error on all versions, so format it explicitly.
     result.map_err(|err| anyhow::anyhow!("eframe failed to start: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn subtitle_flag_accepts_both_spellings() {
+        assert_eq!(
+            parse_args(args(&["--subtitle", "ep.srt"])).expect("parses"),
+            Some(PathBuf::from("ep.srt"))
+        );
+        assert_eq!(
+            parse_args(args(&["-s", "/tmp/ep 1.ass"])).expect("parses"),
+            Some(PathBuf::from("/tmp/ep 1.ass"))
+        );
+        assert_eq!(parse_args(args(&[])).expect("parses"), None);
+    }
+
+    #[test]
+    fn bad_arguments_are_reported_not_ignored() {
+        assert!(parse_args(args(&["--subtitle"]))
+            .expect_err("missing path")
+            .contains("needs a file path"));
+        assert!(parse_args(args(&["--nope"]))
+            .expect_err("unknown flag")
+            .contains("unrecognised argument '--nope'"));
+        // `--help` is a request, not a failure: an empty message.
+        assert!(parse_args(args(&["--help"])).is_err_and(|message| message.is_empty()));
+    }
 }

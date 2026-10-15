@@ -1213,6 +1213,13 @@ impl App {
         self.dashboard_tokens = Some((text, rows));
     }
 
+    /// Queue a subtitle file for the loader thread (the `--subtitle` launch flag, drag-and-drop
+    /// from the desktop, and the file dialog all go through here). `false` when the loader is
+    /// already gone (shutdown) — the caller reports it instead of silently losing the file.
+    pub fn load_subtitle_file(&self, path: std::path::PathBuf) -> bool {
+        self.loader_tx.send(UiCommand::LoadSubtitles(path)).is_ok()
+    }
+
     /// File dialog for a subtitle file. Linux uses the XDG desktop portal (`rfd` with the
     /// `xdg-portal` backend — no GTK dependency, matching the AGENTS.md Wayland story);
     /// other platforms fall back to drag-and-drop onto the overlay.
@@ -1224,7 +1231,7 @@ impl App {
                 .pick_file();
             match picked {
                 Some(path) => {
-                    let _ = self.loader_tx.send(UiCommand::LoadSubtitles(path));
+                    self.load_subtitle_file(path);
                 }
                 None => {
                     self.toasts
@@ -1445,9 +1452,7 @@ impl eframe::App for App {
         for file in dropped {
             let path = file.path();
             if !path.as_os_str().is_empty() {
-                let _ = self
-                    .loader_tx
-                    .send(UiCommand::LoadSubtitles(path.to_path_buf()));
+                self.load_subtitle_file(path.to_path_buf());
             }
         }
 

@@ -3,6 +3,8 @@
 ## Build commands
 
 ```bash
+# run
+cargo run -- --subtitle ep.srt   # preload a subtitle file (no XDG portal needed)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo fmt --manifest-path xtask/Cargo.toml --check
@@ -88,6 +90,7 @@ cargo xtask download-whisper          # download ggml-small.bin into assets/whis
 
 ## Manual QA checklist
 
-- **Headless interaction loop (Xvfb, zero intrusion on the live session).** `Xvfb :99 -screen 0 1920x1080x24`, run the app with `HOME=<scratch> DISPLAY=:99`, drive with `DISPLAY=:99 xdotool` + `xwd` captures decoded via `ffmpeg -i *.xwd *.png`. Proven pattern 2026-10-09: global hotkeys, transport, seeks, token hover/popover, dashboard scrolling, and the full Grab-button download. Two gotchas: egui label clicks toggle checkboxes (click field centers), and headless key delivery needs explicit `xdotool windowfocus` (no WM, no click-to-focus). The portal file picker does NOT work headless (no session bus/backends) — a temporary `ML_AUTOLOAD`-style patch may load tracks for screenshots but must be reverted before commit.
+- **Preload a track without the file dialog:** `--subtitle <file>` (`-s`) queues a load through the same `App::load_subtitle_file` the drag-and-drop and dialog paths use, so the overlay has content at launch — the reliable way to QA/picture the overlay headlessly. `--help` prints usage; an unknown flag or a missing path exits 2 with the reason.
+- **Headless interaction loop (Xvfb, zero intrusion on the live session).** `Xvfb :99 -screen 0 1920x1080x24`, run the app with `HOME=<scratch> DISPLAY=:99`, drive with `DISPLAY=:99 xdotool` + `xwd` captures decoded via `ffmpeg -i *.xwd *.png`. Proven pattern 2026-10-09: global hotkeys, transport, seeks, token hover/popover, dashboard scrolling, and the full Grab-button download. Two gotchas: egui label clicks toggle checkboxes (click field centers), and headless key delivery needs explicit `xdotool windowfocus` (no WM, no click-to-focus). Two more found 2026-10-15: (a) the *manual* clock keeps advancing while you set up the shot, so the cue you meant to capture is gone by the time you press the shutter — `Ctrl+Alt+Space` (or local `Space`) toggles, so restart the app for a fresh zero rather than guessing the transport state; (b) `RUST_LOG=medialingual_native=trace` logs an `overlay layout` line per frame (`origin`, `rows`, `hits`) — `hits` is the token count, and it is the difference between "the overlay is empty because no cue is active" (`origin` centered, `hits=0`) and "hover hit-testing is broken". (c) Never `pkill -f <binary>` while the pattern appears in your own command line — it kills the shell you are typing into; launch through a pid-file script instead. The portal file picker does NOT work headless (no session bus/backends) — a temporary `ML_AUTOLOAD`-style patch may load tracks for screenshots but must be reverted before commit.
 
 (filled in during M4–M8)

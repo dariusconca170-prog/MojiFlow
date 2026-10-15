@@ -811,33 +811,7 @@ fn anki_mini_card(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new(&app.config.anki.model).size(12.0).color(TEXT));
         });
         ui.add_space(6.0);
-        let export = egui::Button::new(
-            RichText::new("↑   Export current card")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        )
-        .fill(ACCENT)
-        .corner_radius(8)
-        .min_size(Vec2::new(ui.available_width(), 42.0));
-        if ui.add(export).clicked() {
-            app.export_current_card();
-        }
-        ui.add_space(6.0);
-        // Sentence cards: the whole line as the expression, with its kana reading, its audio
-        // and — when the local LLM endpoint is set — a translation in the glossary.
-        let sentence = egui::Button::new(
-            RichText::new("≡   Export whole line")
-                .size(14.0)
-                .strong()
-                .color(TEXT),
-        )
-        .fill(CHIP_BG)
-        .corner_radius(8)
-        .min_size(Vec2::new(ui.available_width(), 34.0));
-        if ui.add(sentence).clicked() {
-            app.export_current_sentence();
-        }
+        export_buttons(app, ui);
         ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
@@ -853,6 +827,37 @@ fn anki_mini_card(app: &mut App, ui: &mut egui::Ui) {
             .monospace(),
         );
     });
+}
+
+/// The two mining actions, in one place so the Control Room and the Mining History page
+/// cannot drift apart: a word card from the hovered token, or a sentence card from the
+/// whole line (line, kana reading, audio, and an LLM translation when configured).
+fn export_buttons(app: &mut App, ui: &mut egui::Ui) {
+    let export = egui::Button::new(
+        RichText::new("↑   Export current card")
+            .size(14.0)
+            .strong()
+            .color(Color32::WHITE),
+    )
+    .fill(ACCENT)
+    .corner_radius(8)
+    .min_size(Vec2::new(ui.available_width(), 42.0));
+    if ui.add(export).clicked() {
+        app.export_current_card();
+    }
+    ui.add_space(6.0);
+    let sentence = egui::Button::new(
+        RichText::new("≡   Export whole line")
+            .size(14.0)
+            .strong()
+            .color(TEXT),
+    )
+    .fill(CHIP_BG)
+    .corner_radius(8)
+    .min_size(Vec2::new(ui.available_width(), 34.0));
+    if ui.add(sentence).clicked() {
+        app.export_current_sentence();
+    }
 }
 
 /// Notes that landed while Anki was unreachable, with the one action that helps: retry now.
@@ -1275,18 +1280,7 @@ fn subtitles_page(app: &mut App, ui: &mut egui::Ui) {
 fn mining_page(app: &mut App, ui: &mut egui::Ui) {
     page_title(ui, "◆", "Mining History", "Recent exports this session");
     card(ui, |ui| {
-        let export = egui::Button::new(
-            RichText::new("↑   Export current card")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        )
-        .fill(ACCENT)
-        .corner_radius(8)
-        .min_size(Vec2::new(ui.available_width(), 42.0));
-        if ui.add(export).clicked() {
-            app.export_current_card();
-        }
+        export_buttons(app, ui);
         ui.add_space(6.0);
         if app.status_log.is_empty() {
             ui.label(
