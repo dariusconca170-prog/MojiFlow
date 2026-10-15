@@ -155,6 +155,65 @@ fn warn_skipped(path: &Path, line: usize, reason: &str) {
     tracing::warn!(path = %path.display(), line, reason, "malformed cue skipped");
 }
 
+/// Strip the ASS constructs that leak into SRT/VTT files converted from ASS.
+///
+/// Only `{...}` blocks that *start with a backslash* are dropped (`{\an8}`, `{\i1}`), so
+/// genuine text such as `{sigh}` survives. `\N`/`\n` become line breaks and `\h` a hard
+/// space, per the module's design rule ("strip HTML/ASS override tags").
+pub fn strip_ass_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        match after.find('}') {
+            Some(end) if after.starts_with('\\') => {
+                out.push_str(&rest[..start]);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                // Not an override block (or unterminated): keep the brace literally.
+                out.push_str(&rest[..=start]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+
+    let mut escaped = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some('N') | Some('n') => {
+                    chars.next();
+                    escaped.push('\n');
+                    continue;
+                }
+                Some('h') => {
+                    chars.next();
+                    escaped.push(' ');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// True when `lines[i]` starts the *next* SRT cue: a bare numeric index followed by a
+/// timing line. Files that omit the blank separator between cues are common in the wild;
+/// without this the next cue's index and timing line get glued onto the current cue's text
+/// (and that cue is lost entirely).
+fn srt_starts_next_cue(lines: &[&str], i: usize) -> bool {
+    let line = lines[i].trim();
+    !line.is_empty()
+        && !line.contains("-->")
+        && line.bytes().all(|b| b.is_ascii_digit())
+        && lines.get(i + 1).is_some_and(|next| next.contains("-->"))
+}
+
 // ---------------------------------------------------------------------------
 // SRT
 // ---------------------------------------------------------------------------
@@ -190,12 +249,19 @@ fn parse_srt(text: &str, path: &Path) -> (Vec<Cue>, usize) {
             i += 1;
             let mut body_lines: Vec<&str> = Vec::new();
             while i < lines.len() && !lines[i].trim().is_empty() {
+                if !body_lines.is_empty() && srt_starts_next_cue(&lines, i) {
+                    break; // missing blank separator: leave `i` on the next cue
+                }
                 body_lines.push(lines[i]);
                 i += 1;
             }
-            i += 1; // consume the blank separator (or step past EOF)
+            // Consume the blank separator only when one was actually there: breaking on a
+            // missing separator must not skip the next cue's index line.
+            if i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
             let body = body_lines.join("\n");
-            let text = strip_html_tags(&body);
+            let text = strip_ass_escapes(&strip_html_tags(&body));
             let text = text.trim().to_owned();
             if text.is_empty() {
                 skipped += 1;
@@ -309,7 +375,7 @@ fn parse_vtt(text: &str, path: &Path) -> (Vec<Cue>, usize) {
             }
             i += 1;
             let body = body_lines.join("\n");
-            let cue_text = strip_html_tags(&body);
+            let cue_text = strip_ass_escapes(&strip_html_tags(&body));
             let cue_text = cue_text.trim().to_owned();
             if cue_text.is_empty() {
                 skipped += 1;
@@ -515,6 +581,45 @@ mod tests {
             .join("tests/fixtures")
             .join(name);
         std::fs::read(&path).expect("fixture read")
+    }
+
+    /// A file that forgets the blank separator between cues used to have the next cue's
+    /// index + timing line glued onto the current cue's text, losing that cue entirely.
+    #[test]
+    fn srt_without_blank_separators_keeps_both_cues() {
+        let text =
+            "1\n00:00:01,000 --> 00:00:02,000\nfirst\n2\n00:00:03,000 --> 00:00:04,000\nsecond\n";
+        let (cues, skipped) = parse(Format::Srt, text, std::path::Path::new("compact.srt"));
+        assert_eq!(skipped, 0, "{cues:?}");
+        assert_eq!(cues.len(), 2, "both cues must survive: {cues:?}");
+        assert_eq!(cues[0].text, "first");
+        assert_eq!(cues[1].text, "second");
+        assert_eq!(cues[1].start, Duration::from_millis(3_000));
+    }
+
+    /// ASS constructs leak into SRT/VTT converted from ASS. `{\an8}` used to render as
+    /// literal garbage over the video, contradicting the module's own design rule.
+    #[test]
+    fn ass_escapes_are_stripped_from_srt_and_vtt() {
+        let tagged = "{\\an8}top line";
+
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\n{\\an8}top line\n";
+        let (cues, _) = parse(Format::Srt, srt, std::path::Path::new("t.srt"));
+        assert_eq!(cues[0].text, "top line");
+
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{\\i1}italic{\\i0}\n";
+        let (cues, _) = parse(Format::WebVtt, vtt, std::path::Path::new("t.vtt"));
+        assert_eq!(cues[0].text, "italic");
+
+        assert_eq!(strip_ass_escapes(tagged), "top line");
+        // \N is a line break and \h a hard space.
+        assert_eq!(strip_ass_escapes("one\\Ntwo\\hthree"), "one\ntwo three");
+        // Genuine brace text is not an override block and must survive.
+        assert_eq!(strip_ass_escapes("{sigh} hello"), "{sigh} hello");
+        assert_eq!(
+            strip_ass_escapes("unterminated {oops"),
+            "unterminated {oops"
+        );
     }
 
     #[test]
