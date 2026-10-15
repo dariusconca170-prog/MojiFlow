@@ -323,6 +323,9 @@ pub struct AnkiConfig {
     /// `"none" | "deck" | "first_field" | "deck_tags"` — passed to `allowDuplicate` scope.
     pub duplicate_scope: String,
     pub connect_timeout_ms: u64,
+    /// How often the export worker retries notes sitting in the offline queue while Anki
+    /// was unreachable. `0` disables background retries (a queued note then only goes out
+    /// after the next successful export).
     pub retry_interval_s: u64,
 }
 

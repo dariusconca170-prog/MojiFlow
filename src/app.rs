@@ -384,10 +384,6 @@ impl App {
             }
         };
 
-        // M7: mining export — one worker thread with its own tokio runtime so the Anki
-        // round trip (and media encoding) never touches the UI thread.
-        let export_worker = ExportWorker::spawn(export_events.clone(), Arc::clone(&repaint));
-
         // Offline queue lives next to the config file; temp dir is the fallback when the
         // config path is unknown (e.g. default config without a persisted location).
         let queue_dir = config_path
@@ -395,6 +391,19 @@ impl App {
             .and_then(|path| path.parent())
             .map(|dir| dir.join("queue"))
             .unwrap_or_else(|| std::env::temp_dir().join("medialingual-queue"));
+
+        // M7: mining export — one worker thread with its own tokio runtime so the Anki
+        // round trip (and media encoding) never touches the UI thread. It also gets the
+        // queue up front so `anki.retry_interval_s` can retry notes this session has not
+        // even tried to export yet (e.g. left over from a previous run).
+        let export_worker = ExportWorker::spawn(
+            export_events.clone(),
+            Arc::clone(&repaint),
+            crate::export::RetrySchedule {
+                queue_dir: queue_dir.clone(),
+                anki: config.anki.clone(),
+            },
+        );
 
         // A negative rect component is the "auto bottom-center" sentinel; compute before
         // `config` is moved into the struct.

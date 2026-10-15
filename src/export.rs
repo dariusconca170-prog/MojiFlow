@@ -17,8 +17,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::anki::connect::AnkiConnect;
 use crate::anki::media::MediaFile;
@@ -50,6 +51,28 @@ pub struct ExportSource {
     pub audio_window: Option<(f64, f64)>,
     /// Per-export nonce for media filenames (avoids Anki-side collisions).
     pub nonce: u64,
+}
+
+/// How long the worker waits for the next job before looking at the offline queue again.
+/// Deliberately short: it bounds both how promptly a retry tick can fire and how long
+/// `shutdown` waits for the worker to notice the channel closed.
+const RETRY_TICK: Duration = Duration::from_millis(250);
+
+/// Where (and how often) to retry notes that were queued while Anki was unreachable.
+///
+/// The worker needs this *before* the first export arrives — the retry tick has no
+/// [`ExportSource`] to read a queue directory or Anki config from yet. Values are refreshed
+/// from every incoming source, so edits made in the dashboard take effect.
+#[derive(Debug, Clone)]
+pub struct RetrySchedule {
+    pub queue_dir: PathBuf,
+    pub anki: AnkiConfig,
+}
+
+/// `anki.retry_interval_s` as a duration, or `None` when background retries are switched
+/// off (`0`). Pure, so the scheduling rule is testable without a worker thread.
+pub fn retry_interval(anki: &AnkiConfig) -> Option<Duration> {
+    (anki.retry_interval_s > 0).then(|| Duration::from_secs(anki.retry_interval_s))
 }
 
 /// Plain card contents gathered on the UI thread (mirrors `KNOWN_PLACEHOLDERS` minus media).
@@ -114,11 +137,12 @@ impl ExportWorker {
     pub fn spawn(
         events: crossbeam_channel::Sender<crate::app::CoreEvent>,
         repaint: Arc<crate::app::RepaintHandle>,
+        retry: RetrySchedule,
     ) -> Self {
         let (tx, rx) = crossbeam_channel::bounded::<ExportSource>(8);
         let join = std::thread::Builder::new()
             .name("export-worker".to_owned())
-            .spawn(move || export_thread(rx, events, repaint))
+            .spawn(move || export_thread(rx, events, repaint, retry))
             .ok();
         Self { tx: Some(tx), join }
     }
@@ -152,6 +176,7 @@ fn export_thread(
     rx: Receiver<ExportSource>,
     events: crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: Arc<crate::app::RepaintHandle>,
+    retry: RetrySchedule,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -168,77 +193,133 @@ fn export_thread(
             return;
         }
     };
-    runtime.block_on(worker_loop(rx, events, repaint));
+    runtime.block_on(worker_loop(rx, events, repaint, retry));
 }
 
 async fn worker_loop(
     rx: Receiver<ExportSource>,
     events: crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: Arc<crate::app::RepaintHandle>,
+    mut retry: RetrySchedule,
 ) {
-    // crossbeam's blocking `recv` is fine here: the current-thread runtime parks while
-    // waiting, and `import_one` is the only task, running to its await points.
-    while let Ok(source) = rx.recv() {
-        let (note, skipped) = build_note(&source);
-        let outcome = send_note(&source, &note).await;
-        match outcome {
-            Ok(()) => {
-                let suffix = if skipped.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", skipped.join("; "))
-                };
-                let _ = events.send(crate::app::CoreEvent::Status {
-                    component: "export",
-                    text: format!(
-                        "exported '{}' → {} ({}){}",
-                        source.card.word, source.anki.deck, note.model, suffix
-                    ),
-                });
-                repaint.request();
-
-                // Anki is reachable — retry a few queued notes.
-                let drained = drain_queued(source.queue_dir.clone(), source.anki.clone())
-                    .await
-                    .unwrap_or(0);
-                if drained > 0 {
-                    let _ = events.send(crate::app::CoreEvent::Status {
-                        component: "export",
-                        text: format!("drained {drained} queued note(s)"),
-                    });
+    // crossbeam's blocking `recv_timeout` is fine here: the current-thread runtime parks
+    // while waiting, and this is the only task, running to its await points.
+    let mut last_retry: Option<Instant> = None;
+    loop {
+        match rx.recv_timeout(RETRY_TICK) {
+            Ok(source) => {
+                // The dashboard can change the queue dir or Anki settings mid-session.
+                retry.queue_dir = source.queue_dir.clone();
+                retry.anki = source.anki.clone();
+                handle_source(&source, &events, &repaint).await;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // `anki.retry_interval_s` used to be inert: notes queued while Anki was down
+                // only left after *another* successful export. Tick the queue on its own
+                // cadence instead — starting immediately, so notes from a previous session
+                // go out as soon as Anki answers.
+                let due = retry_interval(&retry.anki)
+                    .is_some_and(|interval| last_retry.is_none_or(|at| at.elapsed() >= interval));
+                if due {
+                    last_retry = Some(Instant::now());
+                    retry_pending(&retry, &events, &repaint).await;
                 }
             }
-            Err(AnkiError::Duplicate(scope)) => {
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// One interval tick: hand anything still queued to Anki. Quiet unless something actually
+/// went out — a toast per tick would repeat forever while Anki stays closed.
+async fn retry_pending(
+    retry: &RetrySchedule,
+    events: &crossbeam_channel::Sender<crate::app::CoreEvent>,
+    repaint: &Arc<crate::app::RepaintHandle>,
+) {
+    if OfflineQueue::new(retry.queue_dir.clone()).pending_count() == 0 {
+        return;
+    }
+    match drain_queued(retry.queue_dir.clone(), retry.anki.clone()).await {
+        Ok(drained) if drained > 0 => {
+            let _ = events.send(crate::app::CoreEvent::Status {
+                component: "export",
+                text: format!("drained {drained} queued note(s)"),
+            });
+            repaint.request();
+        }
+        // Unreachable leaves the notes in place; the next tick tries again.
+        Ok(_) => tracing::debug!("offline queue retry: nothing drained"),
+        Err(err) => tracing::debug!(error = %err, "offline queue retry failed; keeping notes"),
+    }
+}
+
+/// Render, send and report one export (media gathered, queued on failure).
+async fn handle_source(
+    source: &ExportSource,
+    events: &crossbeam_channel::Sender<crate::app::CoreEvent>,
+    repaint: &Arc<crate::app::RepaintHandle>,
+) {
+    let (note, skipped) = build_note(source);
+    let outcome = send_note(source, &note).await;
+    match outcome {
+        Ok(()) => {
+            let suffix = if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", skipped.join("; "))
+            };
+            let _ = events.send(crate::app::CoreEvent::Status {
+                component: "export",
+                text: format!(
+                    "exported '{}' → {} ({}){}",
+                    source.card.word, source.anki.deck, note.model, suffix
+                ),
+            });
+            repaint.request();
+
+            // Anki is reachable — retry queued notes right away rather than waiting for
+            // the next interval tick.
+            let drained = drain_queued(source.queue_dir.clone(), source.anki.clone())
+                .await
+                .unwrap_or(0);
+            if drained > 0 {
                 let _ = events.send(crate::app::CoreEvent::Status {
                     component: "export",
-                    text: format!(
-                        "'{}' already mined (duplicate, scope: {scope})",
-                        source.card.word
-                    ),
+                    text: format!("drained {drained} queued note(s)"),
                 });
-                repaint.request();
             }
-            Err(err) => {
-                // Still renderable — persist it (media included) and retry later.
-                match OfflineQueue::new(source.queue_dir.clone()).push(&note) {
-                    Ok(()) => {
-                        let _ = events.send(crate::app::CoreEvent::Status {
-                            component: "export",
-                            text: format!(
-                                "'{}' queued offline ({err}); retried after the next successful export",
-                                source.card.word
-                            ),
-                        });
-                        repaint.request();
-                    }
-                    Err(queue_err) => {
-                        let _ = events.send(crate::app::CoreEvent::Warning(
-                            crate::error::MlError::Export(ExportError::Queue(format!(
-                                "could not persist '{word}': {queue_err}",
-                                word = source.card.word
-                            ))),
-                        ));
-                    }
+        }
+        Err(AnkiError::Duplicate(scope)) => {
+            let _ = events.send(crate::app::CoreEvent::Status {
+                component: "export",
+                text: format!(
+                    "'{}' already mined (duplicate, scope: {scope})",
+                    source.card.word
+                ),
+            });
+            repaint.request();
+        }
+        Err(err) => {
+            // Still renderable — persist it (media included) and retry later.
+            match OfflineQueue::new(source.queue_dir.clone()).push(&note) {
+                Ok(()) => {
+                    let _ = events.send(crate::app::CoreEvent::Status {
+                        component: "export",
+                        text: format!(
+                            "'{}' queued offline ({err}); retrying every {}s until Anki answers",
+                            source.card.word, source.anki.retry_interval_s
+                        ),
+                    });
+                    repaint.request();
+                }
+                Err(queue_err) => {
+                    let _ = events.send(crate::app::CoreEvent::Warning(
+                        crate::error::MlError::Export(ExportError::Queue(format!(
+                            "could not persist '{word}': {queue_err}",
+                            word = source.card.word
+                        ))),
+                    ));
                 }
             }
         }
@@ -532,6 +613,18 @@ mod tests {
             audio_window: None,
             nonce: 2,
         }));
+    }
+
+    /// `anki.retry_interval_s` maps to a duration, and `0` switches background retries off
+    /// rather than scheduling a tick every second.
+    #[test]
+    fn retry_interval_reads_the_config_and_zero_disables_it() {
+        let mut anki = AnkiConfig::default();
+        assert_eq!(retry_interval(&anki), Some(Duration::from_secs(10)));
+        anki.retry_interval_s = 1;
+        assert_eq!(retry_interval(&anki), Some(Duration::from_secs(1)));
+        anki.retry_interval_s = 0;
+        assert_eq!(retry_interval(&anki), None, "0 disables retries");
     }
 
     /// Regression: the export used to hardcode 128 kbps and skip normalization, so

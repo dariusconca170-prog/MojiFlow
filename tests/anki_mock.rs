@@ -8,10 +8,14 @@ use medialingual_native::anki::connect::AnkiConnect;
 use medialingual_native::anki::media::MediaFile;
 use medialingual_native::anki::note::PendingNote;
 use medialingual_native::anki::queue::OfflineQueue;
+use medialingual_native::app::{CoreEvent, RepaintHandle};
 use medialingual_native::config::AnkiConfig;
 use medialingual_native::error::AnkiError;
+use medialingual_native::export::{ExportWorker, RetrySchedule};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -365,4 +369,115 @@ async fn offline_queue_pushes_rendered_notes_and_drains_into_anki() {
     assert_eq!(exported, 1);
     assert_eq!(*received_files.lock().expect("lock"), vec!["clip.mp3"]);
     assert_eq!(queue.pending_count(), 0);
+}
+
+/// `anki.retry_interval_s` used to be inert: a note queued while Anki was down only left
+/// after *another* successful export. The worker must now drain it on its own cadence —
+/// here with no export of its own at all (the case of notes left by a previous session).
+#[tokio::test]
+async fn export_worker_retries_the_offline_queue_on_its_own() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = OfflineQueue::new(dir.path().to_owned());
+    queue
+        .push(&PendingNote {
+            deck: "Japanese::Mining".to_owned(),
+            model: "Japanese Mining".to_owned(),
+            tags: vec!["medialingual".to_owned()],
+            fields: BTreeMap::from([("Expression".to_owned(), "食べる".to_owned())]),
+            media: vec![],
+        })
+        .expect("push");
+    assert_eq!(queue.pending_count(), 1);
+
+    let server = MockServer::start().await;
+    // The full `export_note` path runs: model check, deck creation, then the note.
+    mount_ok(
+        &server,
+        json!({ "action": "modelNames", "version": 6, "params": {} }),
+        json!(["Japanese Mining"]),
+    )
+    .await;
+    mount_ok(
+        &server,
+        json!({ "action": "createDeck", "version": 6, "params": { "deck": "Japanese::Mining" } }),
+        json!(1),
+    )
+    .await;
+    mount_ok(&server, add_note_body(json!({})), json!(42)).await;
+
+    // The config model must match both the queued note and the modelNames result, or
+    // ensure_model would try to create a model and the drain would never reach addNote.
+    let mut anki = config(server.uri());
+    anki.model = "Japanese Mining".to_owned();
+    anki.retry_interval_s = 1;
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut worker = ExportWorker::spawn(
+        tx,
+        Arc::new(RepaintHandle::new(egui::Context::default())),
+        RetrySchedule {
+            queue_dir: dir.path().to_owned(),
+            anki,
+        },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while queue.pending_count() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    worker.stop();
+    worker.join();
+
+    assert_eq!(
+        queue.pending_count(),
+        0,
+        "the worker must drain queued notes without a fresh export"
+    );
+    let mut reported = false;
+    while let Ok(event) = rx.try_recv() {
+        if let CoreEvent::Status { text, .. } = event {
+            if text.contains("drained 1 queued note") {
+                reported = true;
+            }
+        }
+    }
+    assert!(reported, "the drain must be reported to the UI");
+}
+
+/// The other half of the rule: `retry_interval_s = 0` switches background retries off, so
+/// the queue is left alone until the next real export.
+#[tokio::test]
+async fn export_worker_leaves_the_queue_alone_when_retries_are_disabled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = OfflineQueue::new(dir.path().to_owned());
+    queue
+        .push(&PendingNote {
+            deck: "Japanese::Mining".to_owned(),
+            model: "Japanese Mining".to_owned(),
+            tags: vec![],
+            fields: BTreeMap::from([("Expression".to_owned(), "食べる".to_owned())]),
+            media: vec![],
+        })
+        .expect("push");
+
+    // No mocks mounted at all: any attempt to reach Anki would simply fail, so the point
+    // is that the worker never tries.
+    let mut anki = config("http://127.0.0.1:1".to_owned());
+    anki.retry_interval_s = 0;
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut worker = ExportWorker::spawn(
+        tx,
+        Arc::new(RepaintHandle::new(egui::Context::default())),
+        RetrySchedule {
+            queue_dir: dir.path().to_owned(),
+            anki,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    worker.stop();
+    worker.join();
+    assert_eq!(
+        queue.pending_count(),
+        1,
+        "retries off means the note stays queued"
+    );
 }
