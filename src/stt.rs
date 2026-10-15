@@ -8,6 +8,19 @@
 //! `cargo xtask download-whisper` into `assets/whisper/` (gitignored, like the dict DBs).
 
 use std::path::Path;
+use std::time::Duration;
+
+/// Wall-clock alignment for live cues (`clock.live_cue_delay_ms`): a line transcribed at
+/// ring time `t` is reported at `t + delay_ms`.
+///
+/// Live captions are computed from capture-ring sample positions, which measure elapsed
+/// capture time — not the player's position — so they land on the video late or early by a
+/// roughly constant offset. This lets the user nudge them into place: positive pushes the
+/// cues later, negative pulls them earlier. Clamped at zero so a large negative value can
+/// never produce a negative timestamp (which `SubtitleTrack::active_at` would never match).
+pub fn align_live_cue(seconds: f64, delay_ms: i64) -> Duration {
+    Duration::from_secs_f64((seconds + delay_ms as f64 / 1000.0).max(0.0))
+}
 
 /// One transcribed line, with timestamps in milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +193,20 @@ mod tests {
         // Half amplitude -> half RMS.
         let quiet: Vec<f32> = tone.iter().map(|s| s * 0.5).collect();
         assert!((speech_energy(&quiet) - energy * 0.5).abs() < 0.01);
+    }
+
+    /// `clock.live_cue_delay_ms` shifts live cues both ways and never goes negative.
+    #[test]
+    fn live_cue_alignment_shifts_and_clamps() {
+        assert_eq!(align_live_cue(10.0, 0), Duration::from_secs_f64(10.0));
+        assert_eq!(align_live_cue(10.0, 500), Duration::from_secs_f64(10.5));
+        assert_eq!(align_live_cue(10.0, -250), Duration::from_secs_f64(9.75));
+        assert_eq!(
+            align_live_cue(0.5, -5_000),
+            Duration::ZERO,
+            "a negative delay past the start clamps at zero"
+        );
+        assert_eq!(align_live_cue(0.0, -1), Duration::ZERO);
     }
 
     #[test]

@@ -15,6 +15,10 @@
 //! 3. resample the chunk to 16 kHz and `SttEngine::transcribe` it,
 //! 4. emit each line as `CoreEvent::LiveCue` (App appends it to its live track) and
 //!    advance the shared position to the newest segment end.
+//!
+//! Both the emitted cues and the reported position are shifted by
+//! `clock.live_cue_delay_ms` ([`crate::stt::align_live_cue`]), so the captions and the
+//! clock that drives them stay in step when the user nudges them onto the video.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +29,7 @@ use crate::app::{CoreEvent, RepaintHandle};
 use crate::audio::ring::AudioRing;
 use crate::clock::{PlaybackClock, SyncState};
 use crate::config::SttConfig;
-use crate::stt::{is_speech, resample_to_16k, SttEngine, SttError};
+use crate::stt::{align_live_cue, is_speech, resample_to_16k, SttEngine, SttError};
 use crate::subs::Cue;
 
 /// Poll cadence for new audio plus trailing-silence accounting.
@@ -49,6 +53,9 @@ struct Shared {
 struct WorkerCtx {
     vad: f32,
     language: Option<String>,
+    /// `clock.live_cue_delay_ms` — alignment applied to every cue and to the reported
+    /// position (live captions are timed from ring samples, not the player).
+    cue_delay_ms: i64,
     events: crossbeam_channel::Sender<CoreEvent>,
     repaint: Arc<RepaintHandle>,
     shared: Arc<Mutex<Shared>>,
@@ -67,6 +74,7 @@ impl WhisperLiveClock {
     pub fn spawn(
         ring: Arc<AudioRing>,
         config: &SttConfig,
+        cue_delay_ms: i64,
         events: crossbeam_channel::Sender<CoreEvent>,
         repaint: Arc<RepaintHandle>,
     ) -> Result<Self, SttError> {
@@ -86,6 +94,7 @@ impl WhisperLiveClock {
         let ctx = WorkerCtx {
             vad,
             language,
+            cue_delay_ms,
             events,
             repaint: Arc::clone(&repaint),
             shared: Arc::clone(&shared),
@@ -183,10 +192,13 @@ fn reader_loop(engine: &SttEngine, ring: &AudioRing, ctx: &WorkerCtx) {
                     trailing_silence_ms = 0;
                     last_speech = Some(Instant::now());
                     // Advance position with the live audio so the current line stays put
-                    // even before the model has flushed this chunk.
+                    // even before the model has flushed this chunk. Aligned like the cues,
+                    // so the clock and the captions it drives never disagree.
                     if let Ok(mut s) = ctx.shared.lock() {
-                        s.position =
-                            Duration::from_secs_f64((block_abs + block.len()) as f64 / rate as f64);
+                        s.position = align_live_cue(
+                            (block_abs + block.len()) as f64 / rate as f64,
+                            ctx.cue_delay_ms,
+                        );
                         s.playing = true;
                     }
                 } else if !chunk.is_empty() {
@@ -223,26 +235,27 @@ fn reader_loop(engine: &SttEngine, ring: &AudioRing, ctx: &WorkerCtx) {
 
 fn flush(chunk: &[f32], chunk_start_sample: usize, rate: u64, engine: &SttEngine, ctx: &WorkerCtx) {
     let base_s = chunk_start_sample as f64 / rate as f64;
-    let mut last_end_s = base_s;
+    // Floor at the chunk start so a silent transcription cannot rewind the position.
+    let mut last_end = align_live_cue(base_s, ctx.cue_delay_ms);
     match engine.transcribe(
         &resample_to_16k(chunk, rate as u32),
         ctx.language.as_deref(),
     ) {
         Ok(segments) => {
             for seg in segments {
-                let start_s = base_s + seg.start_ms as f64 / 1000.0;
-                let end_s = base_s + seg.end_ms as f64 / 1000.0;
-                last_end_s = last_end_s.max(end_s);
+                let start = align_live_cue(base_s + seg.start_ms as f64 / 1000.0, ctx.cue_delay_ms);
+                let end = align_live_cue(base_s + seg.end_ms as f64 / 1000.0, ctx.cue_delay_ms);
+                last_end = last_end.max(end);
                 let _ = ctx.events.send(CoreEvent::LiveCue {
                     cue: Cue {
-                        start: Duration::from_secs_f64(start_s),
-                        end: Duration::from_secs_f64(end_s),
+                        start,
+                        end,
                         text: seg.text,
                     },
                 });
             }
             if let Ok(mut s) = ctx.shared.lock() {
-                s.position = Duration::from_secs_f64(last_end_s);
+                s.position = last_end;
                 s.playing = true;
             }
             ctx.repaint.request();

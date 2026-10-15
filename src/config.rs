@@ -125,7 +125,9 @@ pub struct ClockConfig {
     pub mpv_socket: String,
     /// MPRIS bus name filter; empty means auto-detect the first playing player.
     pub mpris_player: String,
-    /// Live STT wall-clock alignment: seconds to shift generated cues.
+    /// Live STT wall-clock alignment: milliseconds to shift generated cues (and the
+    /// position they drive). Live captions are timed from capture-ring samples, not the
+    /// player, so this nudges them onto the video (+ later, − earlier).
     pub live_cue_delay_ms: i64,
 }
 

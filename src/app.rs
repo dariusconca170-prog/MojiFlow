@@ -836,6 +836,7 @@ impl App {
         match crate::clock::whisper_live::WhisperLiveClock::spawn(
             ring,
             &self.config.stt,
+            self.config.clock.live_cue_delay_ms,
             self.events_tx.clone(),
             Arc::clone(&self.repaint),
         ) {
