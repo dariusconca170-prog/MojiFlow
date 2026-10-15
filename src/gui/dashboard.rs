@@ -1218,6 +1218,15 @@ fn anki_page(app: &mut App, ui: &mut egui::Ui) {
             &mut app.config.anki.duplicate_scope,
             "deck",
         );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Queue retry").color(DIM).size(12.0));
+            ui.add(
+                egui::DragValue::new(&mut app.config.anki.retry_interval_s)
+                    .range(ranges::RETRY_INTERVAL_S)
+                    .suffix(" s"),
+            )
+            .on_hover_text("How often to retry queued notes while Anki is unreachable (0 = off)");
+        });
         ui.add_space(4.0);
         ui.label(
             RichText::new("Field mapping")
@@ -1253,6 +1262,22 @@ fn anki_page(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+/// Ranges the settings card exposes.
+///
+/// Constants so [`tests::settings_ranges_stay_inside_the_validator`] can prove a widget can
+/// never produce a config that `config::Validator` rejects — the exact failure mode behind
+/// the offset-step bug (a widget allowed 0, Save then refused, and the app toasted on every
+/// later launch).
+mod ranges {
+    pub const FONT_SIZE: std::ops::RangeInclusive<f32> = 8.0..=160.0;
+    pub const OFFSET_STEP_MS: std::ops::RangeInclusive<i64> = 1..=5000;
+    pub const BUFFER_SECONDS: std::ops::RangeInclusive<f32> = 1.0..=120.0;
+    pub const PADDING_MS: std::ops::RangeInclusive<u32> = 0..=2_000;
+    pub const BITRATE_KBPS: std::ops::RangeInclusive<u32> = 32..=320;
+    pub const LIVE_DELAY_MS: std::ops::RangeInclusive<i64> = -5_000..=5_000;
+    pub const RETRY_INTERVAL_S: std::ops::RangeInclusive<u64> = 0..=3_600;
+}
+
 fn settings_page(app: &mut App, ui: &mut egui::Ui) {
     page_title(ui, "⚙", "Settings", "Live-switchable, saved on demand");
     card(ui, |ui| {
@@ -1274,7 +1299,7 @@ fn settings_page(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("Offset step").color(DIM).size(12.0));
             ui.add(
                 egui::DragValue::new(&mut app.config.subtitle.offset_step_ms)
-                    .range(1..=5000)
+                    .range(ranges::OFFSET_STEP_MS)
                     .suffix(" ms"),
             );
         });
@@ -1286,6 +1311,55 @@ fn settings_page(app: &mut App, ui: &mut egui::Ui) {
                     .desired_width(f32::INFINITY),
             );
         });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Live cue delay").color(DIM).size(12.0));
+            ui.add(
+                egui::DragValue::new(&mut app.config.clock.live_cue_delay_ms)
+                    .range(ranges::LIVE_DELAY_MS)
+                    .suffix(" ms"),
+            )
+            .on_hover_text(
+                "Live transcription alignment: shifts whisper-live cues onto the video \
+                 (+ later, − earlier)",
+            );
+        });
+    });
+    card(ui, |ui| {
+        ui.label(RichText::new("Subtitles").strong().color(TEXT).size(13.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Font size").color(DIM).size(12.0));
+            ui.add(
+                egui::DragValue::new(&mut app.config.subtitle.font_size)
+                    .range(ranges::FONT_SIZE)
+                    .speed(0.5),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Position").color(DIM).size(12.0));
+            let label = app.config.subtitle.position.replace('_', " ");
+            egui::ComboBox::from_id_salt("subtitle-position")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for value in ["bottom_center", "top_center", "custom"] {
+                        ui.selectable_value(
+                            &mut app.config.subtitle.position,
+                            value.to_owned(),
+                            value.replace('_', " "),
+                        );
+                    }
+                });
+            if app.config.subtitle.position == "custom" {
+                ui.add(
+                    egui::Slider::new(&mut app.config.subtitle.custom_y, 0.0..=1.0)
+                        .show_value(false),
+                )
+                .on_hover_text("Vertical position (0 = top, 1 = bottom)");
+            }
+        });
+        ui.checkbox(
+            &mut app.config.subtitle.show_furigana,
+            "Furigana above the kanji",
+        );
     });
     card(ui, |ui| {
         ui.label(RichText::new("Audio").strong().color(TEXT).size(13.0));
@@ -1301,9 +1375,28 @@ fn settings_page(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("Buffer").color(DIM).size(12.0));
             ui.add(
                 egui::DragValue::new(&mut app.config.audio.buffer_seconds)
-                    .range(1.0..=120.0)
+                    .range(ranges::BUFFER_SECONDS)
                     .suffix(" s"),
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Clip padding").color(DIM).size(12.0));
+            ui.add(
+                egui::DragValue::new(&mut app.config.audio.padding_ms)
+                    .range(ranges::PADDING_MS)
+                    .suffix(" ms"),
+            )
+            .on_hover_text("Audio added around each cue when exporting a card");
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Export bitrate").color(DIM).size(12.0));
+            ui.add(
+                egui::DragValue::new(&mut app.config.audio.mp3_bitrate_kbps)
+                    .range(ranges::BITRATE_KBPS)
+                    .suffix(" kbps"),
+            );
+            ui.add_space(8.0);
+            ui.checkbox(&mut app.config.audio.normalize, "Normalize clip");
         });
     });
     card(ui, |ui| {
@@ -1378,7 +1471,6 @@ fn hotkeys_page(app: &App, ui: &mut egui::Ui) {
         );
     });
 }
-
 fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(DIM).size(12.0));
@@ -1433,4 +1525,111 @@ fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
             body(ui);
         });
     ui.add_space(12.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Validator};
+
+    /// Headless render smoke test: the cards that expose the config-only knobs must lay out
+    /// and paint with no window (they are the only GUI path to those settings).
+    #[test]
+    fn settings_and_anki_pages_render_headlessly() {
+        let ctx = egui::Context::default();
+        let _ = crate::gui::fonts::install_cjk_fonts(&ctx);
+        let mut app = crate::app::App::new(
+            Config::default(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            ctx.clone(),
+        );
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            settings_page(&mut app, ui);
+            anki_page(&mut app, ui);
+            hotkeys_page(&app, ui);
+        });
+        output.textures_delta.clear();
+        assert!(
+            !output.shapes.is_empty(),
+            "the settings and anki pages painted nothing"
+        );
+    }
+
+    /// A settings field and how to set it to one of its bounds.
+    type BoundCase = (&'static str, fn(&mut Config, bool));
+
+    /// Every range the settings card exposes must validate at both ends, or Save refuses a
+    /// config the UI itself produced (the offset-step regression). Cheap guard for a whole
+    /// class of bug, kept next to the ranges it protects.
+    #[test]
+    fn settings_ranges_stay_inside_the_validator() {
+        let mutate: [BoundCase; 7] = [
+            ("subtitle.font_size", |c, high| {
+                c.subtitle.font_size = if high {
+                    *ranges::FONT_SIZE.end()
+                } else {
+                    *ranges::FONT_SIZE.start()
+                }
+            }),
+            ("subtitle.offset_step_ms", |c, high| {
+                c.subtitle.offset_step_ms = if high {
+                    *ranges::OFFSET_STEP_MS.end()
+                } else {
+                    *ranges::OFFSET_STEP_MS.start()
+                }
+            }),
+            ("audio.buffer_seconds", |c, high| {
+                c.audio.buffer_seconds = if high {
+                    *ranges::BUFFER_SECONDS.end()
+                } else {
+                    *ranges::BUFFER_SECONDS.start()
+                }
+            }),
+            ("audio.padding_ms", |c, high| {
+                c.audio.padding_ms = if high {
+                    *ranges::PADDING_MS.end()
+                } else {
+                    *ranges::PADDING_MS.start()
+                }
+            }),
+            ("audio.mp3_bitrate_kbps", |c, high| {
+                c.audio.mp3_bitrate_kbps = if high {
+                    *ranges::BITRATE_KBPS.end()
+                } else {
+                    *ranges::BITRATE_KBPS.start()
+                }
+            }),
+            ("clock.live_cue_delay_ms", |c, high| {
+                c.clock.live_cue_delay_ms = if high {
+                    *ranges::LIVE_DELAY_MS.end()
+                } else {
+                    *ranges::LIVE_DELAY_MS.start()
+                }
+            }),
+            ("anki.retry_interval_s", |c, high| {
+                c.anki.retry_interval_s = if high {
+                    *ranges::RETRY_INTERVAL_S.end()
+                } else {
+                    *ranges::RETRY_INTERVAL_S.start()
+                }
+            }),
+        ];
+
+        for (field, apply) in mutate {
+            for high in [false, true] {
+                let mut config = Config::default();
+                apply(&mut config, high);
+                let mut validator = Validator::default();
+                validator.check(&config);
+                assert!(
+                    validator.issues.is_empty(),
+                    "{field} at its {} bound must stay valid, got {:?}",
+                    if high { "upper" } else { "lower" },
+                    validator.issues
+                );
+            }
+        }
+    }
 }
