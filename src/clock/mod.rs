@@ -41,6 +41,14 @@ pub trait PlaybackClock: Send {
     /// Short label for the status strip, e.g. `"mpv-ipc"`.
     fn source_name(&self) -> &'static str;
     fn sync_state(&self) -> SyncState;
+    /// Whether the transport actions (play/pause, seek) can steer this clock. Only the
+    /// manual clock can — every other source follows something external, so the UI reports
+    /// "read-only transport" instead of silently nudging a clock nothing listens to.
+    /// Asked of the *live clock*, not the config: a build without a requested source falls
+    /// back to the manual clock, which still accepts transport.
+    fn accepts_transport(&self) -> bool {
+        false
+    }
     /// Ask any worker threads owned by this clock to stop. Default: nothing to stop.
     fn shutdown(&self) {}
 }

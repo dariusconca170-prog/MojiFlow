@@ -410,16 +410,10 @@ fn media_card(app: &mut App, ui: &mut egui::Ui) {
                 .on_hover_text("Start / pause the manual clock")
                 .clicked()
             {
-                if app.config.clock.source == ClockSource::Manual {
+                if app.transport_available() {
                     app.manual.toggle_play_pause();
                 } else {
-                    app.toasts.push(
-                        format!(
-                            "{} is a live source (read-only transport)",
-                            app.clock.source_name()
-                        ),
-                        true,
-                    );
+                    app.report_live_transport();
                 }
             }
             ui.add_space(6.0);
@@ -474,7 +468,9 @@ fn media_card(app: &mut App, ui: &mut egui::Ui) {
             });
         });
 
-        if app.config.clock.source == ClockSource::Manual {
+        // Same predicate the hotkeys use, so the dashboard and `Ctrl+Alt+Space` never
+        // disagree about whether transport is available.
+        if app.transport_available() {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("<< −5 s").clicked() {
@@ -556,10 +552,9 @@ fn subtitle_card(app: &mut App, ui: &mut egui::Ui) {
                     .on_hover_text("Open a subtitle file")
                     .clicked()
                 {
-                    app.toasts.push(
-                        "use Ctrl+Alt+O or drag a .srt onto the overlay".to_owned(),
-                        false,
-                    );
+                    // Same path as Ctrl+Alt+O — a button labelled "open a subtitle file"
+                    // must not just tell the user to press a different key.
+                    app.open_subtitle_dialog();
                 }
                 if ui
                     .small_button("Copy")
@@ -1161,7 +1156,7 @@ fn subtitles_page(app: &mut App, ui: &mut egui::Ui) {
                 cue.text.replace('\n', " "),
             );
             let response = ui.selectable_label(index == active, RichText::new(label).size(12.0));
-            if response.clicked() && app.config.clock.source == ClockSource::Manual {
+            if response.clicked() && app.transport_available() {
                 app.manual.seek_to(cue.start);
             }
         }

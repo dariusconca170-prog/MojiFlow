@@ -118,6 +118,11 @@ impl PlaybackClock for ManualClock {
     fn sync_state(&self) -> SyncState {
         SyncState::Local
     }
+
+    /// The manual clock is the one clock the transport keys actually drive.
+    fn accepts_transport(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -199,7 +199,9 @@ pub struct AudioConfig {
     /// Padding added around a cue when exporting audio, in milliseconds.
     pub padding_ms: u32,
     pub normalize: bool,
-    /// `"mp3" | "ogg"`
+    /// Output container. Only `"mp3"` is implemented: Anki plays MP3 everywhere and the
+    /// export has no other encoder, so any other value is rejected by the validator rather
+    /// than silently producing an MP3 under a different name.
     pub format: String,
     pub mp3_bitrate_kbps: u32,
 }
@@ -503,9 +505,9 @@ impl Validator {
         if config.audio.buffer_seconds < 1.0 {
             self.push("audio.buffer_seconds must be >= 1".to_owned());
         }
-        if config.audio.format != "mp3" && config.audio.format != "ogg" {
+        if config.audio.format != "mp3" {
             self.push(format!(
-                "audio.format '{}' must be \"mp3\" or \"ogg\"",
+                "audio.format '{}' is not implemented (only \"mp3\")",
                 config.audio.format
             ));
         }
@@ -606,6 +608,26 @@ mod tests {
         let mut validator = Validator::default();
         validator.check(&config);
         assert_eq!(validator.issues.len(), 3, "{:?}", validator.issues);
+    }
+
+    /// Only MP3 is implemented, so the validator must reject other containers instead of
+    /// accepting a value the export silently ignores.
+    #[test]
+    fn unimplemented_audio_format_is_rejected() {
+        let mut config = Config::default();
+        config.audio.format = "ogg".to_owned();
+        let mut validator = Validator::default();
+        validator.check(&config);
+        assert_eq!(validator.issues.len(), 1, "{:?}", validator.issues);
+        assert!(
+            validator.issues[0].to_string().contains("only \"mp3\""),
+            "{:?}",
+            validator.issues[0]
+        );
+        // The default stays valid.
+        let mut default_validator = Validator::default();
+        default_validator.check(&Config::default());
+        assert!(default_validator.issues.is_empty());
     }
 
     #[test]

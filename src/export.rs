@@ -24,10 +24,10 @@ use crate::anki::connect::AnkiConnect;
 use crate::anki::media::MediaFile;
 use crate::anki::note::{CardData, PendingNote};
 use crate::anki::queue::OfflineQueue;
-use crate::audio::encode::encode_mono;
+use crate::audio::encode::{encode_mono, normalize};
 use crate::audio::ring::AudioRing;
 use crate::capture::screen::capture_jpeg;
-use crate::config::{AnkiConfig, CaptureConfig};
+use crate::config::{AnkiConfig, AudioConfig, CaptureConfig};
 use crate::dict::Resolution;
 use crate::error::{AnkiError, ExportError};
 
@@ -36,6 +36,9 @@ pub struct ExportSource {
     /// Rendered-from-dictionary card contents (word, reading, definition, …).
     pub card: MinedCard,
     pub anki: AnkiConfig,
+    /// Audio output settings (`mp3_bitrate_kbps`, `normalize`, `format`) — the clip the
+    /// worker encodes must honor the same config the user edited.
+    pub audio: AudioConfig,
     /// Screenshot target (window title or manual region).
     pub capture: CaptureConfig,
     /// Directory of the offline JSON queue (config dir + `/queue`).
@@ -251,10 +254,20 @@ fn build_note(source: &ExportSource) -> (PendingNote, Vec<String>) {
     let mut image_file = None;
     let mut skipped = Vec::new();
 
+    // `audio.format` is accepted by the config validator for forward compatibility, but only
+    // MP3 is implemented — say so instead of silently labeling an MP3 stream with whatever
+    // extension the config asked for.
+    if source.audio.format != "mp3" {
+        skipped.push(format!(
+            "audio format \"{}\" is not implemented — exported MP3",
+            source.audio.format
+        ));
+    }
+
     if let (Some(ring), Some((start, end))) = (&source.ring, source.audio_window) {
         match ring.read_seconds(start, end) {
             Ok(samples) if !samples.is_empty() => {
-                match encode_mono(&samples, ring.sample_rate(), 128) {
+                match encode_clip(&samples, ring.sample_rate(), &source.audio) {
                     Ok(bytes) => {
                         let file = MediaFile::from_bytes(format!("{filename_base}.mp3"), bytes);
                         audio_file = Some(file.clone());
@@ -287,6 +300,31 @@ fn build_note(source: &ExportSource) -> (PendingNote, Vec<String>) {
         media,
     );
     (note, skipped)
+}
+
+/// Peak target used when `audio.normalize` is on — leaves a little headroom below full
+/// scale so the MP3 encoder never has to clip.
+pub const NORMALIZE_TARGET: f32 = 0.95;
+
+/// Apply the config's clip post-processing before encoding — currently just the optional
+/// peak normalization. Separate from [`encode_clip`] so the normalizing decision is testable
+/// without an encoder round trip.
+pub fn prepare_clip(samples: &mut [f32], audio: &AudioConfig) {
+    if audio.normalize {
+        normalize(samples, NORMALIZE_TARGET);
+    }
+}
+
+/// Encode one ring slice for Anki, honoring the audio config the user edited: the bitrate
+/// (`mp3_bitrate_kbps`) and the optional peak normalization (`normalize`).
+pub fn encode_clip(
+    samples: &[f32],
+    sample_rate: u32,
+    audio: &AudioConfig,
+) -> Result<Vec<u8>, crate::error::AudioError> {
+    let mut prepared: Vec<f32> = samples.to_vec();
+    prepare_clip(&mut prepared, audio);
+    encode_mono(&prepared, sample_rate, audio.mp3_bitrate_kbps)
 }
 
 fn card_from(
@@ -475,6 +513,7 @@ mod tests {
         let source = ExportSource {
             card: MinedCard::default(),
             anki: AnkiConfig::default(),
+            audio: AudioConfig::default(),
             capture: CaptureConfig::default(),
             queue_dir: PathBuf::from("/tmp/opencode"),
             ring: None,
@@ -486,11 +525,65 @@ mod tests {
         assert!(!worker.submit(ExportSource {
             card: MinedCard::default(),
             anki: AnkiConfig::default(),
+            audio: AudioConfig::default(),
             capture: CaptureConfig::default(),
             queue_dir: PathBuf::from("/tmp/opencode"),
             ring: None,
             audio_window: None,
             nonce: 2,
         }));
+    }
+
+    /// Regression: the export used to hardcode 128 kbps and skip normalization, so
+    /// `audio.mp3_bitrate_kbps` / `audio.normalize` were inert config.
+    #[test]
+    fn encode_clip_honors_bitrate_and_normalize() {
+        let sample_rate = 44_100;
+        let quiet: Vec<f32> = (0..sample_rate)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.05
+            })
+            .collect();
+
+        let low = AudioConfig {
+            mp3_bitrate_kbps: 64,
+            ..AudioConfig::default()
+        };
+        let high = AudioConfig {
+            mp3_bitrate_kbps: 192,
+            ..AudioConfig::default()
+        };
+        let small = encode_clip(&quiet, sample_rate, &low).expect("64 kbps encode");
+        let large = encode_clip(&quiet, sample_rate, &high).expect("192 kbps encode");
+        assert!(
+            large.len() > small.len(),
+            "bitrate must change the output size ({} vs {})",
+            large.len(),
+            small.len()
+        );
+
+        // Normalization is applied to the samples the encoder receives — a 0.05-peak clip
+        // must come out at the 0.95 target, and stay untouched when the flag is off.
+        let off = AudioConfig {
+            normalize: false,
+            ..AudioConfig::default()
+        };
+        let mut untouched = quiet.clone();
+        prepare_clip(&mut untouched, &off);
+        assert_eq!(untouched, quiet, "normalize=false must not touch the clip");
+
+        let on = AudioConfig {
+            normalize: true,
+            ..AudioConfig::default()
+        };
+        let mut boosted = quiet.clone();
+        prepare_clip(&mut boosted, &on);
+        let peak = boosted.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            (peak - NORMALIZE_TARGET).abs() < 0.01,
+            "normalize must scale the clip peak (got {peak})"
+        );
+        assert_eq!(boosted.len(), quiet.len(), "normalizing keeps the length");
     }
 }

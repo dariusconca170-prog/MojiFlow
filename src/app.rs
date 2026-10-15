@@ -1060,13 +1060,25 @@ impl App {
             }
             AppAction::OpenSubtitle => self.open_subtitle_dialog(),
             AppAction::ClockStartPause => {
-                self.manual.toggle_play_pause();
+                if self.transport_available() {
+                    self.manual.toggle_play_pause();
+                } else {
+                    self.report_live_transport();
+                }
             }
             AppAction::ClockSeekBack => {
-                self.manual.seek_by(Duration::from_secs(5), false);
+                if self.transport_available() {
+                    self.manual.seek_by(Duration::from_secs(5), false);
+                } else {
+                    self.report_live_transport();
+                }
             }
             AppAction::ClockSeekForward => {
-                self.manual.seek_by(Duration::from_secs(5), true);
+                if self.transport_available() {
+                    self.manual.seek_by(Duration::from_secs(5), true);
+                } else {
+                    self.report_live_transport();
+                }
             }
             AppAction::ToggleEditMode => {
                 self.edit_mode = !self.edit_mode;
@@ -1103,6 +1115,28 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Whether the transport actions (play/pause, seek) can steer the *active* clock. Only the
+    /// manual clock accepts them — mpv/MPRIS follow the real player and the whisper-live clock
+    /// follows the transcription, so `Ctrl+Alt+Space`/`←`/`→` must report instead of poking a
+    /// clock nothing listens to (the dashboard's play button has always done this). Ask the
+    /// clock, not the config: a build without the requested source runs the manual fallback,
+    /// which still takes transport.
+    pub fn transport_available(&self) -> bool {
+        self.clock.accepts_transport()
+    }
+
+    /// One shared message for "this key cannot steer a live clock" — used by the global
+    /// hotkeys and the dashboard transport button so the two never disagree.
+    pub fn report_live_transport(&mut self) {
+        self.toasts.push(
+            format!(
+                "{} is a live source (read-only transport)",
+                self.clock.source_name()
+            ),
+            true,
+        );
     }
 
     /// Recompute the per-token dictionary rows for the dashboard when the active cue text
@@ -1161,7 +1195,7 @@ impl App {
     /// File dialog for a subtitle file. Linux uses the XDG desktop portal (`rfd` with the
     /// `xdg-portal` backend — no GTK dependency, matching the AGENTS.md Wayland story);
     /// other platforms fall back to drag-and-drop onto the overlay.
-    fn open_subtitle_dialog(&mut self) {
+    pub fn open_subtitle_dialog(&mut self) {
         #[cfg(target_os = "linux")]
         {
             let picked = rfd::FileDialog::new()
@@ -1260,7 +1294,9 @@ impl App {
         // cannot produce — e.g. the buffer ran past the line — with a note in the result).
         let ring = self.audio.as_ref().and_then(|audio| audio.ring());
         let audio_window = ring.as_ref().map(|_| {
-            let pad = 0.4;
+            // `audio.padding_ms` is the documented knob for this (default 200 ms); the
+            // window is floored at 1.5 s so a very short line still yields an audible clip.
+            let pad = self.config.audio.padding_ms as f64 / 1000.0;
             let start = (cue_start.as_secs_f64() - pad).max(0.0);
             let end = (cue_end.as_secs_f64() + pad).max(start + 1.5);
             (start, end)
@@ -1269,6 +1305,7 @@ impl App {
         let source = ExportSource {
             card,
             anki: self.config.anki.clone(),
+            audio: self.config.audio.clone(),
             capture: self.config.capture.clone(),
             queue_dir: self.queue_dir.clone(),
             ring,
@@ -1576,6 +1613,57 @@ mod tests {
         let rect = bottom_center_rect(screen, [1100.0, 320.0]);
         assert_eq!(rect[0], 0.0);
         assert_eq!(rect[1], 0.0);
+    }
+
+    /// A clock that follows an external player: never accepts transport. Stands in for
+    /// mpv/MPRIS/whisper-live without spawning threads or touching a session bus.
+    struct FakeLiveClock;
+
+    impl crate::clock::PlaybackClock for FakeLiveClock {
+        fn now(&self) -> Duration {
+            Duration::from_secs(7)
+        }
+        fn is_playing(&self) -> bool {
+            true
+        }
+        fn source_name(&self) -> &'static str {
+            "fake-live"
+        }
+        fn sync_state(&self) -> crate::clock::SyncState {
+            crate::clock::SyncState::Live
+        }
+    }
+
+    /// `Ctrl+Alt+Space`/`←`/`→` used to poke the *manual* clock even when a live source was
+    /// active — a silent no-op with no feedback (the dashboard's play button reported it, the
+    /// hotkeys did not). They must report and leave the manual clock untouched.
+    #[test]
+    fn transport_keys_report_for_a_live_clock_instead_of_poking_manual() {
+        use crate::hotkey::AppAction;
+
+        let mut app = App::new(
+            Config::default(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        assert!(app.transport_available(), "the default clock is manual");
+
+        app.clock = Box::new(FakeLiveClock);
+        assert!(!app.transport_available());
+        app.manual.set_playing(false);
+        app.apply_action(AppAction::ClockStartPause);
+        assert!(
+            !app.manual.is_playing(),
+            "a live clock must not be silently replaced by manual transport"
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|toast| toast.message.contains("live source")),
+            "the user must be told why the key did nothing"
+        );
     }
 
     #[test]

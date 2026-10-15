@@ -11,8 +11,8 @@ entries (definition, reading, pitch accent, frequency) on hover — the fastest 
 > control-room dashboard, and the mining-export pipeline). M8 polish shipped so far:
 > bottom-anchored subtitles, fullscreen-follow, the waiting hint, the local-LLM Explain
 > button, the "start at seconds" clock arm, a live settings card (clock source switches
-> without a restart, config persists to disk), and this README — with Whisper STT and a
-> full settings editor still to come. A user audio review (2026-10-10) also removed the
+> without a restart, config persists to disk), the local Whisper-live STT clock
+> (`--features whisper`), and this README — with a full settings editor still to come. A user audio review (2026-10-10) also removed the
 > yt-dlp grab flow, the dashboard audio card, and the launch-time demo text. See
 > [`PLAN.md`](PLAN.md) for the milestone checklist and status log, and `AGENTS.md` for build
 > notes, architecture, and platform caveats.
