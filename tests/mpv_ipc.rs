@@ -81,7 +81,8 @@ fn mpv_ipc_clock_tracks_real_playback() {
         socket_str,
         tx,
         Arc::new(RepaintHandle::new(egui::Context::default())),
-    );
+    )
+    .expect("spawn clock");
 
     // 1) The reader thread must connect and go live (mpv may need a moment to create
     //    the socket).

@@ -66,14 +66,18 @@ pub fn build_clock(
     match config.source {
         ClockSource::Manual => (Box::new(manual) as Box<dyn PlaybackClock>, None),
         ClockSource::MpvIpc => {
-            let clock = mpv_ipc::MpvIpcClock::spawn(config.mpv_socket.clone(), events, repaint);
-            (Box::new(clock), None)
+            match mpv_ipc::MpvIpcClock::spawn(config.mpv_socket.clone(), events, repaint) {
+                Ok(clock) => (Box::new(clock) as Box<dyn PlaybackClock>, None),
+                // Same degradation as the other sources: keep the overlay usable on the manual
+                // clock and report why (a spawn failure can no longer panic the UI thread).
+                Err(err) => (Box::new(manual), Some(err)),
+            }
         }
         ClockSource::Mpris => {
             #[cfg(target_os = "linux")]
-            {
-                let clock = mpris::MprisClock::spawn(config.mpris_player.clone(), events, repaint);
-                (Box::new(clock) as Box<dyn PlaybackClock>, None)
+            match mpris::MprisClock::spawn(config.mpris_player.clone(), events, repaint) {
+                Ok(clock) => (Box::new(clock) as Box<dyn PlaybackClock>, None),
+                Err(err) => (Box::new(manual), Some(err)),
             }
             #[cfg(not(target_os = "linux"))]
             {

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::{PlaybackClock, SyncState};
 use crate::app::{CoreEvent, RepaintHandle};
+use crate::error::ClockError;
 
 /// How often the UI may repaint while the mpv clock is live (10 fps keeps idle CPU low;
 /// `now()` extrapolates between updates).
@@ -54,12 +55,14 @@ pub struct MpvIpcClock {
 }
 
 impl MpvIpcClock {
-    /// Spawn the IPC reader thread and return immediately (UI thread never blocks).
+    /// Spawn the IPC reader thread and return immediately (UI thread never blocks). A
+    /// failed thread spawn is a typed error, never a panic: this runs from `build_clock`,
+    /// including a live source switch in the settings card.
     pub fn spawn(
         socket_path: String,
         events: crossbeam_channel::Sender<CoreEvent>,
         repaint: Arc<RepaintHandle>,
-    ) -> Self {
+    ) -> Result<Self, ClockError> {
         let shared = Arc::new(Mutex::new(Shared {
             position: Duration::ZERO,
             updated: Instant::now(),
@@ -72,14 +75,20 @@ impl MpvIpcClock {
         let thread_shared = Arc::clone(&shared);
         let thread_shutdown = Arc::clone(&shutdown);
 
+        // Never panic here: this runs from `build_clock`, including a live source switch in
+        // the settings card, where a failed thread spawn must degrade to the manual clock
+        // with a typed error rather than taking the whole overlay down.
         std::thread::Builder::new()
             .name("mpv-ipc-clock".to_owned())
             .spawn(move || {
                 reader_thread(socket_path, thread_shared, thread_shutdown, events, repaint)
             })
-            .expect("spawn mpv IPC thread");
+            .map_err(|err| ClockError::Unavailable {
+                component: "mpv-ipc".to_owned(),
+                reason: format!("could not spawn the mpv IPC thread: {err}"),
+            })?;
 
-        Self { shared, shutdown }
+        Ok(Self { shared, shutdown })
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Shared) -> R) -> R {
@@ -540,7 +549,8 @@ mod tests {
             "/nonexistent/medialingual-test.sock".to_owned(),
             crossbeam_channel::bounded(4).0,
             Arc::new(RepaintHandle::for_tests()),
-        );
+        )
+        .expect("spawn clock");
         match clock.sync_state() {
             SyncState::Stale(reason) => assert!(reason.contains("connecting"), "{reason}"),
             other => panic!("expected Stale, got {other:?}"),

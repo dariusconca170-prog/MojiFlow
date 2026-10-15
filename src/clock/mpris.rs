@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use super::{PlaybackClock, SyncState};
 use crate::app::{CoreEvent, RepaintHandle};
+use crate::error::ClockError;
 
 /// How often the UI may repaint while the clock is live (position is extrapolated between
 /// updates, so this only affects smoothness).
@@ -54,11 +55,13 @@ pub struct MprisClock {
 
 impl MprisClock {
     /// Spawn the D-Bus observer thread (with its own tokio runtime) and return immediately.
+    /// A failed thread spawn is a typed error, never a panic — this runs from `build_clock`,
+    /// including a live source switch in the settings card.
     pub fn spawn(
         player_filter: String,
         events: crossbeam_channel::Sender<CoreEvent>,
         repaint: Arc<RepaintHandle>,
-    ) -> Self {
+    ) -> Result<Self, ClockError> {
         let shared = Arc::new(Mutex::new(Shared {
             position: Duration::ZERO,
             updated: Instant::now(),
@@ -92,9 +95,12 @@ impl MprisClock {
                     }
                 }
             })
-            .expect("spawn mpris clock thread");
+            .map_err(|err| ClockError::Unavailable {
+                component: "mpris".to_owned(),
+                reason: format!("could not spawn the MPRIS thread: {err}"),
+            })?;
 
-        Self { shared, shutdown }
+        Ok(Self { shared, shutdown })
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Shared) -> R) -> R {
@@ -513,7 +519,8 @@ mod tests {
             String::new(),
             crossbeam_channel::bounded(4).0,
             Arc::new(RepaintHandle::for_tests()),
-        );
+        )
+        .expect("spawn clock");
         match clock.sync_state() {
             // The reason varies by environment (connecting… → session bus unavailable,
             // or "no player found" when a bus exists); what matters is the initial state
