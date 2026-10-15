@@ -8,16 +8,17 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::anki::queue::OfflineQueue;
 use crate::audio::capture::AudioCapture;
 use crate::capture::window::GlobalPointer;
 use crate::clock::{self, manual::ManualClock, PlaybackClock};
 use crate::config::{ClockSource, Config};
 use crate::dict::Dictionary;
 use crate::error::MlError;
-use crate::export::{mine_card, ExportSource, ExportWorker};
+use crate::export::{mine_card, mine_sentence, ExportKind, ExportSource, ExportWorker};
 use crate::gui::dashboard::TokenRow;
 use crate::gui::popover::PopoverData;
-use crate::hotkey::{AppAction, GlobalHotkeys};
+use crate::hotkey::{local_actions, parse_local_key, AppAction, GlobalHotkeys, LocalKey};
 use crate::subs::SubtitleTrack;
 use crate::tokenize::{JapaneseTokenizer, Token};
 
@@ -242,10 +243,14 @@ pub struct App {
     // --- M7: global hotkeys + mining export ---
     /// Registered global hotkeys; `None` when manager init failed (local keys remain).
     hotkeys: Option<GlobalHotkeys>,
+    /// Bare keys that only fire while the overlay is focused, from `config.hotkeys.local_*`.
+    /// Resolved once at startup (they are not editable in the UI, so a live rebuild would
+    /// only add a second source of truth); unparsable specs are reported as config issues.
+    local_keys: Vec<(LocalKey, AppAction)>,
     /// Background exporter (own tokio runtime): media + Anki + offline queue.
     export_worker: Option<ExportWorker>,
-    /// Offline queue directory (config dir + `/queue`).
-    queue_dir: std::path::PathBuf,
+    /// Offline queue directory (config dir + `/queue`); read by the dashboard's queue card.
+    pub queue_dir: std::path::PathBuf,
     /// Lock: forces the overlay interactive everywhere (move/click) until unlocked.
     pub locked: bool,
     /// Visibility: `false` hides the whole overlay (hotkey Ctrl+Alt+H).
@@ -384,6 +389,17 @@ impl App {
             }
         };
 
+        // Local keys are parsed here too, so a typo in `[hotkeys]` local_* is reported with
+        // the other startup issues instead of silently doing nothing.
+        let mut local_keys = Vec::new();
+        for (spec, action) in local_actions(&config.hotkeys) {
+            match parse_local_key(spec) {
+                Ok(Some(key)) => local_keys.push((key, action)),
+                Ok(None) => {}
+                Err(err) => issues.push(MlError::Hotkey(err)),
+            }
+        }
+
         // Offline queue lives next to the config file; temp dir is the fallback when the
         // config path is unknown (e.g. default config without a persisted location).
         let queue_dir = config_path
@@ -452,6 +468,7 @@ impl App {
             audio_active_key: None,
             audio_last_error: None,
             hotkeys,
+            local_keys,
             export_worker: Some(export_worker),
             queue_dir,
             locked: false,
@@ -977,39 +994,30 @@ impl App {
         });
     }
 
-    /// Handle local (overlay-focused) keys for M2: `[`/`]` offset, `Space`
-    /// play/pause, arrows seek — the global variants arrive in M7 via `global-hotkey`.
+    /// Handle the *local* keys — the `config.hotkeys.local_*` bindings (bare `S`, `Shift+S`,
+    /// `[`/`]`, `Space`, arrows by default). They only fire while the overlay is focused and
+    /// the keyboard is not already owned by a text field, and they route through
+    /// [`Self::apply_action`] so a local key and its global twin can never disagree.
+    /// These four bindings used to be hardcoded, leaving `local_export`/`local_offset_*`
+    /// decorative.
     pub fn handle_local_keys(&mut self, ui: &egui::Ui) {
-        let step = self.config.subtitle.offset_step_ms;
-        let actions = ui.input(|i| {
-            if !i.focused {
-                return None;
-            }
-            Some((
-                i.key_pressed(egui::Key::OpenBracket),
-                i.key_pressed(egui::Key::CloseBracket),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::Space),
-            ))
-        });
-        let Some((back, fwd, seek_back, seek_fwd, toggle)) = actions else {
+        // A focused widget (an editing text field) owns the keyboard: a bare `S` there must
+        // type, not mine.
+        let typing = ui.ctx().memory(|memory| memory.focused().is_some());
+        let focused = ui.input(|i| i.focused) && !typing;
+        if !focused {
             return;
-        };
-        if back {
-            self.adjust_offset(-step);
         }
-        if fwd {
-            self.adjust_offset(step);
-        }
-        if toggle {
-            self.manual.toggle_play_pause();
-        }
-        if seek_back {
-            self.manual.seek_by(Duration::from_secs(5), false);
-        }
-        if seek_fwd {
-            self.manual.seek_by(Duration::from_secs(5), true);
+        let pressed: Vec<AppAction> = ui.input(|i| {
+            self.local_keys
+                .iter()
+                .filter(|(key, _)| key.pressed(i))
+                .map(|(_, action)| *action)
+                .collect()
+        });
+        for action in pressed {
+            tracing::debug!(?action, "local key pressed");
+            self.apply_action(action);
         }
     }
 
@@ -1042,6 +1050,9 @@ impl App {
         match action {
             AppAction::ExportCard => {
                 self.export_current_card();
+            }
+            AppAction::ExportSentence => {
+                self.export_current_sentence();
             }
             AppAction::OffsetBack => {
                 let step = self.config.subtitle.offset_step_ms;
@@ -1230,10 +1241,21 @@ impl App {
         }
     }
 
+    /// Mine the hovered (else first content) word of the active line — the classic word card.
+    pub fn export_current_card(&mut self) -> bool {
+        self.export_active_cue(ExportKind::Token)
+    }
+
+    /// Mine the whole active line as one sentence card: the line as the expression, its kana
+    /// reading, its audio and still, and (when the local LLM endpoint is set) a translation.
+    pub fn export_current_sentence(&mut self) -> bool {
+        self.export_active_cue(ExportKind::Sentence)
+    }
+
     /// Gather the current cue into an [`ExportSource`] (UI thread — [`Dictionary`] is not
     /// `Sync`) and hand it to the export worker. Returns `false` with a toast when nothing
     /// is mineable or the worker is busy.
-    pub fn export_current_card(&mut self) -> bool {
+    fn export_active_cue(&mut self, kind: ExportKind) -> bool {
         // Copy the pieces we need out of the track first: the borrow on `self.track` must
         // end before we call `&mut self` methods below.
         let Some(index) = self.active_cue else {
@@ -1261,46 +1283,61 @@ impl App {
         };
 
         let tokens = self.tokens_cached(&text);
-        // Prefer the hovered/pinned token; fall back to the first content word of the cue.
-        let surface = self
-            .hover_token
-            .or(self.pinned_token)
-            .and_then(|index| tokens.get(index))
-            .map(|token| token.surface.clone())
-            .or_else(|| {
-                tokens
-                    .iter()
-                    .find(|token| token.is_content_word())
+        // `{sentence_furigana}` used to be hardcoded empty, so the mapped field could never
+        // carry anything. Same tokenizer output the overlay shows.
+        let furigana = crate::furigana::sentence_furigana(tokens.as_slice());
+        let (card, label) = match kind {
+            ExportKind::Sentence => (
+                mine_sentence(
+                    &text,
+                    &furigana,
+                    &crate::furigana::sentence_reading(tokens.as_slice()),
+                    cue_start.as_secs_f64(),
+                    &source_name,
+                ),
+                format!("line '{}'", line_label(&text)),
+            ),
+            ExportKind::Token => {
+                // Prefer the hovered/pinned token; fall back to the first content word.
+                let Some(surface) = self
+                    .hover_token
+                    .or(self.pinned_token)
+                    .and_then(|index| tokens.get(index))
                     .map(|token| token.surface.clone())
-            });
-        let Some(surface) = surface else {
-            self.toasts.push(
-                "nothing to export: hover a token in the line first".to_owned(),
-                true,
-            );
-            return false;
+                    .or_else(|| {
+                        tokens
+                            .iter()
+                            .find(|token| token.is_content_word())
+                            .map(|token| token.surface.clone())
+                    })
+                else {
+                    self.toasts.push(
+                        "nothing to export: hover a token in the line first".to_owned(),
+                        true,
+                    );
+                    return false;
+                };
+                let resolution = match &mut self.dictionary {
+                    Some(dictionary) => match dictionary.resolve_detailed(&surface) {
+                        Ok(resolution) => resolution,
+                        Err(err) => {
+                            tracing::warn!(error = %err, surface, "dictionary lookup failed during export");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let card = mine_card(
+                    &surface,
+                    resolution.as_ref(),
+                    &text,
+                    &furigana,
+                    cue_start.as_secs_f64(),
+                    &source_name,
+                );
+                (card, format!("'{surface}'"))
+            }
         };
-
-        let resolution = match &mut self.dictionary {
-            Some(dictionary) => match dictionary.resolve_detailed(&surface) {
-                Ok(resolution) => resolution,
-                Err(err) => {
-                    tracing::warn!(error = %err, surface, "dictionary lookup failed during export");
-                    None
-                }
-            },
-            None => None,
-        };
-        let card = mine_card(
-            &surface,
-            resolution.as_ref(),
-            &text,
-            // `{sentence_furigana}` used to be hardcoded empty, so the mapped field could
-            // never carry anything. Same tokenizer output the overlay shows.
-            &crate::furigana::sentence_furigana(tokens.as_slice()),
-            cue_start.as_secs_f64(),
-            &source_name,
-        );
 
         // Audio window around the cue, only when a ring exists (the worker skips media it
         // cannot produce — e.g. the buffer ran past the line — with a note in the result).
@@ -1316,6 +1353,8 @@ impl App {
 
         let source = ExportSource {
             card,
+            kind,
+            explain: self.config.explain.clone(),
             anki: self.config.anki.clone(),
             audio: self.config.audio.clone(),
             capture: self.config.capture.clone(),
@@ -1329,7 +1368,7 @@ impl App {
             .as_ref()
             .is_some_and(|worker| worker.submit(source));
         if accepted {
-            self.toasts.push(format!("exporting '{surface}'…"), false);
+            self.toasts.push(format!("exporting {label}…"), false);
             true
         } else {
             self.toasts.push(
@@ -1338,6 +1377,46 @@ impl App {
             );
             false
         }
+    }
+
+    /// What the dashboard's queue card shows: how many notes are waiting, the oldest age,
+    /// a preview of the oldest one and how many files are unreadable. Filesystem work, but
+    /// the directory holds a handful of small JSON files — called once per dashboard frame.
+    pub fn queue_status(&self) -> QueueStatus {
+        self.queue_status_at(std::time::SystemTime::now())
+    }
+
+    /// [`Self::queue_status`] against an explicit "now", so age formatting is testable.
+    pub fn queue_status_at(&self, now: std::time::SystemTime) -> QueueStatus {
+        let (entries, unreadable) = OfflineQueue::new(self.queue_dir.clone()).pending_detailed();
+        let mut rows = Vec::new();
+        for (path, note) in entries {
+            // The oldest field is what the user recognizes the note by (usually Expression).
+            let preview = note
+                .fields
+                .values()
+                .find(|value| !value.trim().is_empty())
+                .map(|value| line_label(value))
+                .unwrap_or_else(|| "(empty note)".to_owned());
+            let queued = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok());
+            rows.push(QueuedNote { preview, queued });
+        }
+        QueueStatus {
+            dir: self.queue_dir.clone(),
+            unreadable,
+            rows,
+        }
+    }
+
+    /// Drain the offline queue on the export worker right now (dashboard "Retry now").
+    /// Returns `false` when the worker is gone or its queue is full.
+    pub fn retry_offline_queue(&self) -> bool {
+        self.export_worker
+            .as_ref()
+            .is_some_and(|worker| worker.retry_now())
     }
 
     /// Ask every worker to stop and join it. Safe to call more than once.
@@ -1516,6 +1595,45 @@ impl eframe::App for App {
     }
 }
 
+/// One note waiting in the offline queue, as the dashboard shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedNote {
+    /// Short label of the note (its first non-empty field).
+    pub preview: String,
+    /// How long it has been waiting, when the file's mtime is readable.
+    pub queued: Option<Duration>,
+}
+
+/// Snapshot of the offline queue for the dashboard card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueStatus {
+    pub dir: std::path::PathBuf,
+    /// Entries that could not be parsed (kept on disk, reported honestly).
+    pub unreadable: usize,
+    /// Pending notes, oldest first.
+    pub rows: Vec<QueuedNote>,
+}
+
+impl QueueStatus {
+    /// Notes that will actually be exported.
+    pub fn count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Short single-line label for a whole cue, used in export toasts: newlines collapsed,
+/// truncated on a char boundary so a long line cannot flood the toast. Pure and testable.
+pub fn line_label(text: &str) -> String {
+    const MAX_CHARS: usize = 24;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_CHARS {
+        return collapsed;
+    }
+    let mut out: String = collapsed.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// Bottom-center placement for the overlay: centered horizontally, sitting just above the
 /// bottom edge so it clears panels/taskbars. Pure and testable.
 pub fn bottom_center_rect(screen: egui::Rect, size: [f32; 2]) -> [f32; 4] {
@@ -1561,6 +1679,108 @@ mod tests {
         app.switch_clock_source(ClockSource::Manual);
         assert_eq!(app.config.clock.source, ClockSource::Manual);
         assert!(!app.ever_started);
+    }
+
+    /// The dashboard's queue card reads this: what is waiting, how long, and whether any
+    /// file is unreadable (which used to be silently invisible).
+    #[test]
+    fn queue_status_reports_pending_notes_age_and_unreadable_files() {
+        let dir = std::env::temp_dir().join(format!("ml-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let queue_dir = dir.join("queue");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        let app = App::new(
+            Config::default(),
+            Some(dir.join("config.toml")),
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        assert_eq!(app.queue_status().count(), 0, "nothing queued yet");
+
+        crate::anki::queue::OfflineQueue::new(queue_dir.clone())
+            .push(&crate::anki::note::PendingNote {
+                deck: "Japanese::Mining".to_owned(),
+                model: "Japanese Mining (medialingual)".to_owned(),
+                tags: vec!["medialingual".to_owned()],
+                fields: std::collections::BTreeMap::from([(
+                    "Expression".to_owned(),
+                    "食べる".to_owned(),
+                )]),
+                media: vec![],
+            })
+            .expect("push");
+
+        let status = app.queue_status();
+        assert_eq!(status.count(), 1);
+        assert_eq!(
+            status.rows[0].preview, "食べる",
+            "preview is the note's field"
+        );
+        assert!(
+            status.rows[0].queued.is_some(),
+            "the age comes from the entry's mtime"
+        );
+        assert_eq!(status.dir, queue_dir);
+
+        // A corrupt entry is reported, not hidden (and never deleted).
+        let broken = queue_dir.join("0000000000000000000-broken.json");
+        std::fs::write(&broken, b"{ not json").expect("write broken entry");
+        let status = app.queue_status();
+        assert_eq!(status.count(), 1);
+        assert_eq!(status.unreadable, 1);
+        assert!(broken.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The local bindings are resolved at startup: the two export keys must be there, and a
+    /// typo must be reported as a startup issue rather than silently doing nothing.
+    #[test]
+    fn local_keys_resolve_and_report_typos() {
+        let mut config = Config::default();
+        let app = App::new(
+            config.clone(),
+            None,
+            Vec::new(),
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        let actions: Vec<AppAction> = app.local_keys.iter().map(|(_, action)| *action).collect();
+        assert!(actions.contains(&AppAction::ExportCard));
+        assert!(actions.contains(&AppAction::ExportSentence));
+        assert!(actions.contains(&AppAction::ClockStartPause));
+
+        config.hotkeys.local_export_sentence = "Shift+NotAKey".to_owned();
+        let issues = Vec::new();
+        let app = App::new(
+            config,
+            None,
+            issues,
+            crate::gui::fonts::FontSource::Embedded,
+            egui::Context::default(),
+        );
+        assert!(
+            !app.local_keys
+                .iter()
+                .any(|(_, action)| *action == AppAction::ExportSentence),
+            "an unparsable spec binds nothing"
+        );
+        assert!(app
+            .config_issues
+            .iter()
+            .any(|issue| issue.to_string().contains("local key")));
+    }
+
+    #[test]
+    fn line_labels_collapse_and_truncate_on_char_boundaries() {
+        assert_eq!(line_label("私は学生です。"), "私は学生です。");
+        assert_eq!(line_label("  a  b "), "a b");
+        let long = "あ".repeat(30);
+        let label = line_label(&long);
+        assert_eq!(label.chars().count(), 25, "24 chars + ellipsis: {label}");
+        assert!(label.ends_with('…'));
+        // Japanese has no spaces, so truncation must not invent any.
+        assert!(!label.contains(' '));
     }
 
     #[test]

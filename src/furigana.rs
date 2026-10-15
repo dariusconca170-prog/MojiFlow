@@ -107,9 +107,37 @@ pub fn sentence_furigana(tokens: &[Token]) -> String {
     out
 }
 
+/// The whole sentence in kana — `{sentence_reading}`, the `Reading` field of a sentence
+/// card (the whole line has no single dictionary reading, and IPADIC already knows one for
+/// every token). Kana-only tokens keep their surface, so particles and punctuation are not
+/// rewritten; only tokens the tokenizer gives a real reading for are converted.
+pub fn sentence_reading(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        if token.reading.is_empty() || !token.surface.chars().any(is_kanji) {
+            out.push_str(&token.surface);
+        } else {
+            out.push_str(&katakana_to_hiragana(&token.reading));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_reading_is_kana_and_survives_every_token() {
+        let tokenizer = crate::tokenize::JapaneseTokenizer::new().expect("tokenizer");
+        let tokens = tokenizer.tokenize("私は学生です。").expect("tokenize");
+        assert_eq!(sentence_reading(&tokens), "わたしはがくせいです。");
+        // An unknown reading must never silently drop the word from the sentence.
+        let mut broken = tokens.clone();
+        broken[0].reading = String::new();
+        assert_eq!(sentence_reading(&broken), "私はがくせいです。");
+        assert_eq!(sentence_reading(&[]), "");
+    }
 
     #[test]
     fn katakana_readings_become_hiragana_without_touching_the_choonpu() {

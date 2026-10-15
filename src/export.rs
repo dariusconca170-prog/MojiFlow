@@ -28,14 +28,27 @@ use crate::anki::queue::OfflineQueue;
 use crate::audio::encode::{encode_mono, normalize};
 use crate::audio::ring::AudioRing;
 use crate::capture::screen::capture_jpeg;
-use crate::config::{AnkiConfig, AudioConfig, CaptureConfig};
+use crate::config::{AnkiConfig, AudioConfig, CaptureConfig, ExplainConfig};
 use crate::dict::Resolution;
 use crate::error::{AnkiError, ExportError};
+
+/// What a job mines: the hovered word, or the whole active line as one sentence card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    /// One word (`{word}` = the dictionary headword).
+    Token,
+    /// The whole cue (`{word}` = the line itself, `{reading}` = its kana transcription).
+    Sentence,
+}
 
 /// Everything the export worker needs — all plain data, no locks, no display handles.
 pub struct ExportSource {
     /// Rendered-from-dictionary card contents (word, reading, definition, …).
     pub card: MinedCard,
+    /// Word card or sentence card. Only `Sentence` asks the local LLM for a translation.
+    pub kind: ExportKind,
+    /// Local LLM endpoint used to translate a sentence card (`{definition}`).
+    pub explain: ExplainConfig,
     pub anki: AnkiConfig,
     /// Audio output settings (`mp3_bitrate_kbps`, `normalize`, `format`) — the clip the
     /// worker encodes must honor the same config the user edited.
@@ -125,10 +138,42 @@ pub fn mine_card(
     }
 }
 
+/// Build a [`MinedCard`] for the *whole active line* — a "sentence card". The line is both
+/// the expression and the sentence, `{reading}` carries a kana transcription of it (the
+/// tokenizer's readings, which is as close to a whole-sentence reading as the data allows),
+/// and the definition is left empty for the worker to fill from the local LLM.
+pub fn mine_sentence(
+    sentence: &str,
+    sentence_furigana: &str,
+    sentence_reading: &str,
+    cue_start_s: f64,
+    source_name: &str,
+) -> MinedCard {
+    MinedCard {
+        word: sentence.to_owned(),
+        reading: sentence_reading.to_owned(),
+        definition: String::new(),
+        sentence: sentence.to_owned(),
+        sentence_furigana: sentence_furigana.to_owned(),
+        source: format!("{} @ {}", source_name, format_timestamp(cue_start_s)),
+        ..MinedCard::default()
+    }
+}
+
+/// One unit of work for the export worker.
+///
+/// `RetryQueue` exists so the dashboard's "Retry now" button can push the *same* drain the
+/// retry tick performs, instead of a second code path that talks to Anki from the UI thread
+/// (which would block the frame) or a second worker (which would race the first one).
+enum Job {
+    Export(Box<ExportSource>),
+    RetryQueue,
+}
+
 /// Background exporter: one worker thread with its own tokio runtime; jobs arrive over a
 /// bounded channel and results/errors come back as `CoreEvent`s.
 pub struct ExportWorker {
-    tx: Option<Sender<ExportSource>>,
+    tx: Option<Sender<Job>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -139,7 +184,7 @@ impl ExportWorker {
         repaint: Arc<crate::app::RepaintHandle>,
         retry: RetrySchedule,
     ) -> Self {
-        let (tx, rx) = crossbeam_channel::bounded::<ExportSource>(8);
+        let (tx, rx) = crossbeam_channel::bounded::<Job>(8);
         let join = std::thread::Builder::new()
             .name("export-worker".to_owned())
             .spawn(move || export_thread(rx, events, repaint, retry))
@@ -150,8 +195,17 @@ impl ExportWorker {
     /// Hand a job to the worker. Returns `false` (and the source is lost) only when the
     /// channel is full or the worker already exited — surfaced by the caller as a toast.
     pub fn submit(&self, source: ExportSource) -> bool {
+        self.send(Job::Export(Box::new(source)))
+    }
+
+    /// Ask the worker to drain the offline queue right now (dashboard "Retry now").
+    pub fn retry_now(&self) -> bool {
+        self.send(Job::RetryQueue)
+    }
+
+    fn send(&self, job: Job) -> bool {
         match self.tx.as_ref() {
-            Some(tx) => match tx.try_send(source) {
+            Some(tx) => match tx.try_send(job) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
             },
@@ -173,7 +227,7 @@ impl ExportWorker {
 }
 
 fn export_thread(
-    rx: Receiver<ExportSource>,
+    rx: Receiver<Job>,
     events: crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: Arc<crate::app::RepaintHandle>,
     retry: RetrySchedule,
@@ -197,7 +251,7 @@ fn export_thread(
 }
 
 async fn worker_loop(
-    rx: Receiver<ExportSource>,
+    rx: Receiver<Job>,
     events: crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: Arc<crate::app::RepaintHandle>,
     mut retry: RetrySchedule,
@@ -207,11 +261,17 @@ async fn worker_loop(
     let mut last_retry: Option<Instant> = None;
     loop {
         match rx.recv_timeout(RETRY_TICK) {
-            Ok(source) => {
+            Ok(Job::Export(source)) => {
                 // The dashboard can change the queue dir or Anki settings mid-session.
                 retry.queue_dir = source.queue_dir.clone();
                 retry.anki = source.anki.clone();
                 handle_source(&source, &events, &repaint).await;
+            }
+            Ok(Job::RetryQueue) => {
+                // An explicit request, so it happens even with `retry_interval_s = 0` —
+                // "retry now" is the user overriding the schedule for one tick. Unlike the
+                // silent background tick, this one always answers (the user is watching).
+                retry_pending(&retry, &events, &repaint, true).await;
             }
             Err(RecvTimeoutError::Timeout) => {
                 // `anki.retry_interval_s` used to be inert: notes queued while Anki was down
@@ -222,7 +282,7 @@ async fn worker_loop(
                     .is_some_and(|interval| last_retry.is_none_or(|at| at.elapsed() >= interval));
                 if due {
                     last_retry = Some(Instant::now());
-                    retry_pending(&retry, &events, &repaint).await;
+                    retry_pending(&retry, &events, &repaint, false).await;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -230,27 +290,46 @@ async fn worker_loop(
     }
 }
 
-/// One interval tick: hand anything still queued to Anki. Quiet unless something actually
-/// went out — a toast per tick would repeat forever while Anki stays closed.
+/// One retry pass: hand anything still queued to Anki. The background tick stays quiet
+/// unless something actually went out (a status line per tick would repeat forever while
+/// Anki stays closed); `explicit` is the dashboard's "Retry now", which always answers.
 async fn retry_pending(
     retry: &RetrySchedule,
     events: &crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: &Arc<crate::app::RepaintHandle>,
+    explicit: bool,
 ) {
-    if OfflineQueue::new(retry.queue_dir.clone()).pending_count() == 0 {
+    let status = |text: String| {
+        let _ = events.send(crate::app::CoreEvent::Status {
+            component: "export",
+            text,
+        });
+        repaint.request();
+    };
+    let pending = OfflineQueue::new(retry.queue_dir.clone()).pending_count();
+    if pending == 0 {
+        if explicit {
+            status("nothing queued offline".to_owned());
+        }
         return;
     }
     match drain_queued(retry.queue_dir.clone(), retry.anki.clone()).await {
-        Ok(drained) if drained > 0 => {
-            let _ = events.send(crate::app::CoreEvent::Status {
-                component: "export",
-                text: format!("drained {drained} queued note(s)"),
-            });
-            repaint.request();
-        }
+        Ok(drained) if drained > 0 => status(format!("drained {drained} queued note(s)")),
         // Unreachable leaves the notes in place; the next tick tries again.
-        Ok(_) => tracing::debug!("offline queue retry: nothing drained"),
-        Err(err) => tracing::debug!(error = %err, "offline queue retry failed; keeping notes"),
+        Ok(_) => {
+            tracing::debug!("offline queue retry: nothing drained");
+            if explicit {
+                status(format!(
+                    "{pending} queued note(s) still waiting — Anki unreachable?"
+                ));
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "offline queue retry failed; keeping notes");
+            if explicit {
+                status(format!("retry failed: {err}"));
+            }
+        }
     }
 }
 
@@ -260,7 +339,16 @@ async fn handle_source(
     events: &crossbeam_channel::Sender<crate::app::CoreEvent>,
     repaint: &Arc<crate::app::RepaintHandle>,
 ) {
-    let (note, skipped) = build_note(source);
+    let mut skipped = Vec::new();
+    let translation = match fetch_translation(source).await {
+        Ok(translation) => translation,
+        Err(note) => {
+            skipped.push(note);
+            None
+        }
+    };
+    let (note, mut media_skipped) = build_note(source, translation.as_deref());
+    skipped.append(&mut media_skipped);
     let outcome = send_note(source, &note).await;
     match outcome {
         Ok(()) => {
@@ -326,9 +414,37 @@ async fn handle_source(
     }
 }
 
+/// The line's English translation from the local LLM, for a sentence card only.
+///
+/// `Ok(None)` means "nothing to do": a word card, or no endpoint configured. An `Err` is a
+/// human note about *skipped* media — a missing translation must never fail the export,
+/// since the audio and the line itself are the parts that matter.
+async fn fetch_translation(source: &ExportSource) -> Result<Option<String>, String> {
+    if source.kind != ExportKind::Sentence {
+        return Ok(None);
+    }
+    let Some(request) =
+        crate::explain::ExplainRequest::translation(&source.explain, source.card.sentence.clone())
+    else {
+        return Ok(None);
+    };
+    // The HTTP client has its own timeout; this wraps the whole call so a wedged server
+    // cannot hold the export worker (and therefore the next job) indefinitely.
+    let budget = Duration::from_secs(request.timeout_s.saturating_add(5));
+    match tokio::time::timeout(budget, crate::explain::fetch_async(&request)).await {
+        Ok(Ok(text)) => Ok(Some(text)),
+        Ok(Err(err)) => Err(format!("translation skipped ({err})")),
+        Err(_) => Err(format!(
+            "translation skipped (no answer in {}s)",
+            request.timeout_s
+        )),
+    }
+}
+
 /// Render the note and gather media (ring slice → MP3, screenshot → JPEG). Media that is
-/// unavailable is skipped with a human note; the card is still exported.
-fn build_note(source: &ExportSource) -> (PendingNote, Vec<String>) {
+/// unavailable is skipped with a human note; the card is still exported. `translation`
+/// overrides the glossary of a sentence card when the local LLM answered.
+fn build_note(source: &ExportSource, translation: Option<&str>) -> (PendingNote, Vec<String>) {
     let filename_base = format!("ml_{}_{}", sanitize_label(&source.card.word), source.nonce);
     let mut media = Vec::new();
     let mut audio_file = None;
@@ -371,7 +487,7 @@ fn build_note(source: &ExportSource) -> (PendingNote, Vec<String>) {
         Err(err) => skipped.push(format!("image skipped ({err})")),
     }
 
-    let card = card_from(source, audio_file, image_file);
+    let card = card_from(source, audio_file, image_file, translation);
     let note = PendingNote::from_mapping(
         &source.anki.deck,
         &source.anki.model,
@@ -412,11 +528,14 @@ fn card_from(
     source: &ExportSource,
     audio: Option<MediaFile>,
     image: Option<MediaFile>,
+    translation: Option<&str>,
 ) -> CardData {
     CardData {
         word: source.card.word.clone(),
         reading: source.card.reading.clone(),
-        definition: source.card.definition.clone(),
+        definition: translation
+            .map(str::to_owned)
+            .unwrap_or_else(|| source.card.definition.clone()),
         sentence: source.card.sentence.clone(),
         sentence_furigana: source.card.sentence_furigana.clone(),
         pitch: source.card.pitch.clone(),
@@ -563,6 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn mine_sentence_fills_the_line_its_kana_and_its_source() {
+        let card = mine_sentence(
+            "私は学生です。",
+            "<ruby>私<rt>わたし</rt></ruby>は<ruby>学生<rt>がくせい</rt></ruby>です。",
+            "わたしはがくせいです。",
+            65.0,
+            "ep.srt",
+        );
+        // The whole line is the expression (the default model puts `Expression` on the
+        // front), and the sentence field carries the same line.
+        assert_eq!(card.word, "私は学生です。");
+        assert_eq!(card.sentence, "私は学生です。");
+        assert_eq!(card.reading, "わたしはがくせいです。");
+        assert!(card.sentence_furigana.contains("<rt>わたし</rt>"));
+        // No dictionary entry is involved, so nothing may be invented for these.
+        assert_eq!(card.definition, "");
+        assert_eq!(card.pitch, "");
+        assert_eq!(card.frequency, "");
+        assert_eq!(card.source, "ep.srt @ 00:01:05.000");
+    }
+
+    #[test]
     fn sanitize_label_keeps_ascii_and_collapses_separators() {
         assert_eq!(sanitize_label("食べる"), "word");
         assert_eq!(sanitize_label("taberu"), "taberu");
@@ -583,16 +724,16 @@ mod tests {
         assert_eq!(format_timestamp(-3.0), "00:00:00.000");
     }
 
-    #[test]
-    fn worker_submit_rejects_when_channel_is_closed() {
-        let (tx, rx) = crossbeam_channel::bounded::<ExportSource>(1);
-        let mut worker = ExportWorker {
-            tx: Some(tx),
-            join: None,
-        };
-        drop(rx); // pretend the thread exited
-        let source = ExportSource {
-            card: MinedCard::default(),
+    /// An [`ExportSource`] with nothing but the fields a translation needs.
+    fn source(kind: ExportKind, explain: ExplainConfig) -> ExportSource {
+        ExportSource {
+            card: MinedCard {
+                word: "私は学生です。".to_owned(),
+                sentence: "私は学生です。".to_owned(),
+                ..MinedCard::default()
+            },
+            kind,
+            explain,
             anki: AnkiConfig::default(),
             audio: AudioConfig::default(),
             capture: CaptureConfig::default(),
@@ -600,19 +741,95 @@ mod tests {
             ring: None,
             audio_window: None,
             nonce: 1,
+        }
+    }
+
+    #[test]
+    fn worker_submit_rejects_when_channel_is_closed() {
+        let (tx, rx) = crossbeam_channel::bounded::<Job>(1);
+        let mut worker = ExportWorker {
+            tx: Some(tx),
+            join: None,
         };
-        assert!(!worker.submit(source));
+        drop(rx); // pretend the thread exited
+        assert!(!worker.submit(source(ExportKind::Token, ExplainConfig::default())));
         worker.stop();
-        assert!(!worker.submit(ExportSource {
-            card: MinedCard::default(),
-            anki: AnkiConfig::default(),
-            audio: AudioConfig::default(),
-            capture: CaptureConfig::default(),
-            queue_dir: PathBuf::from("/tmp/opencode"),
-            ring: None,
-            audio_window: None,
-            nonce: 2,
-        }));
+        assert!(!worker.submit(source(ExportKind::Sentence, ExplainConfig::default())));
+        // A dead worker must refuse the retry request too, so the dashboard can say so
+        // instead of leaving the button looking like it worked.
+        assert!(!worker.retry_now());
+    }
+
+    /// The worker only asks the local LLM for a *sentence* card, and only when the endpoint
+    /// is configured — a word card's `{definition}` is the dictionary's business.
+    #[tokio::test]
+    async fn translation_is_requested_for_sentences_only() {
+        assert_eq!(
+            fetch_translation(&source(ExportKind::Token, ExplainConfig::default())).await,
+            Ok(None),
+            "a word card must not call the LLM"
+        );
+        let disabled = ExplainConfig {
+            endpoint: String::new(),
+            ..ExplainConfig::default()
+        };
+        assert_eq!(
+            fetch_translation(&source(ExportKind::Sentence, disabled)).await,
+            Ok(None),
+            "no endpoint: no translation, and no failed export"
+        );
+    }
+
+    /// Full worker-side round trip: the translation the LLM returns is what lands in the
+    /// glossary field (`{definition}`), not the empty one gathered on the UI thread.
+    #[tokio::test]
+    async fn sentence_translation_fills_the_glossary_field() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": "I am a student." } }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let explain = ExplainConfig {
+            endpoint: format!("{}/v1/chat/completions", server.uri()),
+            ..ExplainConfig::default()
+        };
+        let source = source(ExportKind::Sentence, explain);
+        let translation = fetch_translation(&source)
+            .await
+            .expect("translation is available")
+            .expect("the LLM answered");
+        assert_eq!(translation, "I am a student.");
+
+        let card = card_from(&source, None, None, Some(&translation));
+        assert_eq!(card.definition, "I am a student.");
+        assert_eq!(card.word, "私は学生です。");
+    }
+
+    /// A server that answers with an unreadable body must *skip* the translation with a
+    /// note — never fail the export that carries the audio and the line.
+    #[tokio::test]
+    async fn a_broken_llm_answer_skips_the_translation_with_a_note() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "choices": [] })),
+            )
+            .mount(&server)
+            .await;
+        let explain = ExplainConfig {
+            endpoint: format!("{}/v1/chat/completions", server.uri()),
+            ..ExplainConfig::default()
+        };
+        let note = fetch_translation(&source(ExportKind::Sentence, explain))
+            .await
+            .expect_err("unreadable answer is a skip note");
+        assert!(note.starts_with("translation skipped"), "{note}");
     }
 
     /// `anki.retry_interval_s` maps to a duration, and `0` switches background retries off

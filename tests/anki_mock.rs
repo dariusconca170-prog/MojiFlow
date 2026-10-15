@@ -443,6 +443,103 @@ async fn export_worker_retries_the_offline_queue_on_its_own() {
     assert!(reported, "the drain must be reported to the UI");
 }
 
+/// The dashboard's "Retry now" button: an explicit drain must work even with background
+/// retries switched *off*, which is what makes it different from waiting for the next tick.
+#[tokio::test]
+async fn export_worker_drains_on_an_explicit_request_with_retries_disabled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = OfflineQueue::new(dir.path().to_owned());
+    queue
+        .push(&PendingNote {
+            deck: "Japanese::Mining".to_owned(),
+            model: "Japanese Mining".to_owned(),
+            tags: vec!["medialingual".to_owned()],
+            fields: BTreeMap::from([("Expression".to_owned(), "食べる".to_owned())]),
+            media: vec![],
+        })
+        .expect("push");
+
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        json!({ "action": "modelNames", "version": 6, "params": {} }),
+        json!(["Japanese Mining"]),
+    )
+    .await;
+    mount_ok(
+        &server,
+        json!({ "action": "createDeck", "version": 6, "params": { "deck": "Japanese::Mining" } }),
+        json!(1),
+    )
+    .await;
+    mount_ok(&server, add_note_body(json!({})), json!(42)).await;
+
+    let mut anki = config(server.uri());
+    anki.model = "Japanese Mining".to_owned();
+    // Background retries off: only the explicit request can drain the queue.
+    anki.retry_interval_s = 0;
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut worker = ExportWorker::spawn(
+        tx,
+        Arc::new(RepaintHandle::new(egui::Context::default())),
+        RetrySchedule {
+            queue_dir: dir.path().to_owned(),
+            anki,
+        },
+    );
+
+    // Give the worker a moment to be idle, then ask it to drain.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(worker.retry_now(), "the worker accepts a retry request");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while queue.pending_count() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    worker.stop();
+    worker.join();
+
+    assert_eq!(queue.pending_count(), 0, "Retry now must drain the queue");
+    let mut reported = false;
+    while let Ok(event) = rx.try_recv() {
+        if let CoreEvent::Status { text, .. } = event {
+            if text.contains("drained 1 queued note") {
+                reported = true;
+            }
+        }
+    }
+    assert!(reported, "the explicit retry must report what it did");
+
+    // And with an empty queue it says so instead of going silent.
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut worker = ExportWorker::spawn(
+        tx,
+        Arc::new(RepaintHandle::new(egui::Context::default())),
+        RetrySchedule {
+            queue_dir: dir.path().to_owned(),
+            anki: config("http://127.0.0.1:1".to_owned()),
+        },
+    );
+    assert!(worker.retry_now());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut empty_note = None;
+    while Instant::now() < deadline && empty_note.is_none() {
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::Status { text, .. } = event {
+                empty_note = Some(text);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    worker.stop();
+    worker.join();
+    assert_eq!(
+        empty_note.as_deref(),
+        Some("nothing queued offline"),
+        "an explicit retry on an empty queue answers"
+    );
+}
+
 /// The other half of the rule: `retry_interval_s = 0` switches background retries off, so
 /// the queue is left alone until the next real export.
 #[tokio::test]

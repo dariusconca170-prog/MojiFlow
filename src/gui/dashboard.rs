@@ -18,7 +18,7 @@ use crate::clock::SyncState;
 use crate::config::ClockSource;
 use crate::export::format_timestamp;
 use crate::gui::popover::PopoverData;
-use crate::hotkey::configured_actions;
+use crate::hotkey::{configured_actions, local_actions};
 
 // --- palette (dark indigo, matches the design mock) ---
 const BG: Color32 = Color32::from_rgb(10, 14, 23);
@@ -353,6 +353,7 @@ fn control_room(app: &mut App, ui: &mut egui::Ui) {
         audio_card(app, &mut cols[0]);
         anki_mini_card(app, &mut cols[1]);
     });
+    queue_card(app, ui);
 }
 
 fn page_title(ui: &mut egui::Ui, icon: &str, title: &str, subtitle: &str) {
@@ -823,6 +824,21 @@ fn anki_mini_card(app: &mut App, ui: &mut egui::Ui) {
             app.export_current_card();
         }
         ui.add_space(6.0);
+        // Sentence cards: the whole line as the expression, with its kana reading, its audio
+        // and — when the local LLM endpoint is set — a translation in the glossary.
+        let sentence = egui::Button::new(
+            RichText::new("≡   Export whole line")
+                .size(14.0)
+                .strong()
+                .color(TEXT),
+        )
+        .fill(CHIP_BG)
+        .corner_radius(8)
+        .min_size(Vec2::new(ui.available_width(), 34.0));
+        if ui.add(sentence).clicked() {
+            app.export_current_sentence();
+        }
+        ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
                 "AnkiConnect · {}",
@@ -837,6 +853,98 @@ fn anki_mini_card(app: &mut App, ui: &mut egui::Ui) {
             .monospace(),
         );
     });
+}
+
+/// Notes that landed while Anki was unreachable, with the one action that helps: retry now.
+/// Before this card the queue was invisible — a single toast line at export time was the
+/// only sign it existed, and nothing said how many notes were waiting or for how long.
+fn queue_card(app: &mut App, ui: &mut egui::Ui) {
+    let status = app.queue_status();
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("⇅").size(15.0).color(ACCENT_LIGHT));
+            ui.label(
+                RichText::new("Offline queue")
+                    .size(14.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if status.count() == 0 {
+                    pill(ui, "● Empty", GREEN_BG, GREEN);
+                } else {
+                    pill(
+                        ui,
+                        &format!("● {} waiting", status.count()),
+                        AMBER_BG,
+                        AMBER,
+                    );
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if status.count() == 0 {
+            ui.label(
+                RichText::new("Everything mined so far reached Anki.")
+                    .size(12.0)
+                    .color(DIM),
+            );
+        } else {
+            for row in status.rows.iter().take(4) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&row.preview).size(12.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let age = row
+                            .queued
+                            .map(|age| format!("waiting {}", short_duration(age)))
+                            .unwrap_or_else(|| "waiting".to_owned());
+                        ui.label(RichText::new(age).size(11.0).color(FAINT));
+                    });
+                });
+            }
+            if status.rows.len() > 4 {
+                ui.label(
+                    RichText::new(format!("+{} more", status.rows.len() - 4))
+                        .size(11.0)
+                        .color(FAINT),
+                );
+            }
+        }
+        if status.unreadable > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{} unreadable file(s) kept in {}",
+                    status.unreadable,
+                    status.dir.display()
+                ))
+                .size(11.0)
+                .color(AMBER),
+            );
+        }
+        ui.add_space(6.0);
+        let retry = egui::Button::new(RichText::new("↻   Retry now").size(13.0).color(TEXT))
+            .fill(CHIP_BG)
+            .corner_radius(8)
+            .min_size(Vec2::new(ui.available_width(), 30.0));
+        if ui.add(retry).clicked() && !app.retry_offline_queue() {
+            app.toasts.push(
+                "export worker is busy — try again in a moment".to_owned(),
+                true,
+            );
+        }
+    });
+}
+
+/// `95s` / `4m` / `2h` — short enough for a card row.
+fn short_duration(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 // --- inspector (right rail) ----------------------------------------------------------
@@ -1094,6 +1202,7 @@ fn quick_keys(app: &App, ui: &mut egui::Ui) {
         let hotkeys = &app.config.hotkeys;
         for (label, spec) in [
             ("Export card", hotkeys.export_card.as_str()),
+            ("Export line", hotkeys.export_sentence.as_str()),
             ("Pause clock", hotkeys.clock_start_pause.as_str()),
             ("Open subtitle", hotkeys.open_subtitle.as_str()),
         ] {
@@ -1461,10 +1570,32 @@ fn hotkeys_page(app: &App, ui: &mut egui::Ui) {
                     ui.end_row();
                 }
             });
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("Overlay-focused keys")
+                .size(12.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.add_space(2.0);
+        egui::Grid::new("hotkeys-local")
+            .striped(true)
+            .spacing(Vec2::new(24.0, 6.0))
+            .show(ui, |ui| {
+                for (spec, action) in local_actions(&app.config.hotkeys) {
+                    ui.label(RichText::new(action.label()).color(TEXT).size(12.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        kbd(ui, spec);
+                    });
+                    ui.end_row();
+                }
+            });
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "Bare keys (S, [, ]) work only while the overlay is focused or its popover is hovered.",
+                "These only fire while the overlay is focused (or its popover is hovered) and the \
+                 keyboard is not in a text field — a bare `S` cannot be registered globally \
+                 without stealing it from every other app.",
             )
             .color(DIM)
             .size(11.0),
@@ -1545,7 +1676,29 @@ mod tests {
             crate::gui::fonts::FontSource::Embedded,
             ctx.clone(),
         );
+        // A queued note so the offline-queue card renders its populated branch, and a
+        // corrupt entry so the unreadable-file warning is part of the smoke test.
+        let dir = std::env::temp_dir().join(format!("ml-dash-{}", std::process::id()));
+        let queue_dir = dir.join("queue");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        crate::anki::queue::OfflineQueue::new(queue_dir.clone())
+            .push(&crate::anki::note::PendingNote {
+                deck: "Japanese::Mining".to_owned(),
+                model: "Japanese Mining (medialingual)".to_owned(),
+                tags: vec!["medialingual".to_owned()],
+                fields: std::collections::BTreeMap::from([(
+                    "Expression".to_owned(),
+                    "食べる".to_owned(),
+                )]),
+                media: vec![],
+            })
+            .expect("push");
+        std::fs::write(queue_dir.join("0000000000000000000-broken.json"), b"{nope")
+            .expect("write broken entry");
+        app.queue_dir = queue_dir;
+
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            control_room(&mut app, ui);
             settings_page(&mut app, ui);
             anki_page(&mut app, ui);
             hotkeys_page(&app, ui);
@@ -1553,8 +1706,20 @@ mod tests {
         output.textures_delta.clear();
         assert!(
             !output.shapes.is_empty(),
-            "the settings and anki pages painted nothing"
+            "the control room, settings, anki and hotkeys pages painted nothing"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queue_ages_read_as_seconds_minutes_hours() {
+        use std::time::Duration;
+        assert_eq!(short_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(short_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(short_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(short_duration(Duration::from_secs(3_599)), "59m");
+        assert_eq!(short_duration(Duration::from_secs(3_600)), "1h");
+        assert_eq!(short_duration(Duration::from_secs(86_400)), "24h");
     }
 
     /// A settings field and how to set it to one of its bounds.

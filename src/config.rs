@@ -151,6 +151,8 @@ impl Default for ClockConfig {
 #[serde(default)]
 pub struct HotkeysConfig {
     pub export_card: String,
+    /// Mine the whole active line as one sentence card.
+    pub export_sentence: String,
     pub offset_back: String,
     pub offset_forward: String,
     pub toggle_lock: String,
@@ -163,16 +165,22 @@ pub struct HotkeysConfig {
     pub toggle_status: String,
     /// Open/close the control-room dashboard window.
     pub toggle_dashboard: String,
-    /// Bare keys accepted only while the overlay is focused or its popover is hovered.
+    /// Bare keys accepted only while the overlay is focused or its popover is hovered
+    /// (never while a text field has keyboard focus).
     pub local_export: String,
+    pub local_export_sentence: String,
     pub local_offset_back: String,
     pub local_offset_forward: String,
+    pub local_clock_start_pause: String,
+    pub local_seek_back: String,
+    pub local_seek_forward: String,
 }
 
 impl Default for HotkeysConfig {
     fn default() -> Self {
         Self {
             export_card: "Ctrl+Alt+S".to_owned(),
+            export_sentence: "Ctrl+Alt+Shift+S".to_owned(),
             offset_back: "Ctrl+Alt+[".to_owned(),
             offset_forward: "Ctrl+Alt+]".to_owned(),
             toggle_lock: "Ctrl+Alt+L".to_owned(),
@@ -185,8 +193,12 @@ impl Default for HotkeysConfig {
             toggle_status: "Ctrl+Alt+P".to_owned(),
             toggle_dashboard: "Ctrl+Alt+D".to_owned(),
             local_export: "S".to_owned(),
+            local_export_sentence: "Shift+S".to_owned(),
             local_offset_back: "[".to_owned(),
             local_offset_forward: "]".to_owned(),
+            local_clock_start_pause: "Space".to_owned(),
+            local_seek_back: "ArrowLeft".to_owned(),
+            local_seek_forward: "ArrowRight".to_owned(),
         }
     }
 }

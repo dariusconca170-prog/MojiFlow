@@ -16,6 +16,36 @@ const SYSTEM_PROMPT: &str = "You are a Japanese tutor for an English-speaking le
     Explain the meaning and grammar of the given sentence simply, in English, \
     in under 120 words. Pay special attention to the focused word.";
 
+/// A sentence card wants a translation, not a lecture — same endpoint, different ask.
+const TRANSLATE_PROMPT: &str = "You translate Japanese sentences for a language learner's \
+    flashcards. Reply with one natural English translation and nothing else: no romaji, no \
+    grammar notes, no quotation marks.";
+
+/// What is being asked of the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainTask {
+    /// Explain the line and focus on one word (the popover's ✨ button).
+    Explain,
+    /// One English translation of the line — the `{definition}` of a sentence card.
+    Translate,
+}
+
+impl ExplainTask {
+    fn system_prompt(self) -> &'static str {
+        match self {
+            Self::Explain => SYSTEM_PROMPT,
+            Self::Translate => TRANSLATE_PROMPT,
+        }
+    }
+
+    fn user_prompt(self, sentence: &str, focus: &str) -> String {
+        match self {
+            Self::Explain => format!("Sentence: {sentence}\nFocused word: {focus}"),
+            Self::Translate => format!("Sentence: {sentence}"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExplainError {
     #[error("explain request failed: {0}")]
@@ -35,10 +65,27 @@ pub struct ExplainRequest {
     pub focus: String,
     pub max_tokens: u32,
     pub timeout_s: u64,
+    pub task: ExplainTask,
 }
 
 impl ExplainRequest {
     pub fn from_config(config: &ExplainConfig, sentence: String, focus: String) -> Option<Self> {
+        Self::build(config, sentence, focus, ExplainTask::Explain)
+    }
+
+    /// A translation of the whole line for a sentence card. `None` when the endpoint is
+    /// unset — a sentence card without a local LLM still exports, just with an empty
+    /// glossary.
+    pub fn translation(config: &ExplainConfig, sentence: String) -> Option<Self> {
+        Self::build(config, sentence, String::new(), ExplainTask::Translate)
+    }
+
+    fn build(
+        config: &ExplainConfig,
+        sentence: String,
+        focus: String,
+        task: ExplainTask,
+    ) -> Option<Self> {
         if config.endpoint.trim().is_empty() {
             return None;
         }
@@ -49,11 +96,12 @@ impl ExplainRequest {
             focus,
             max_tokens: config.max_tokens,
             timeout_s: config.timeout_s.max(1),
+            task,
         })
     }
 
     fn user_prompt(&self) -> String {
-        format!("Sentence: {}\nFocused word: {}", self.sentence, self.focus)
+        self.task.user_prompt(&self.sentence, &self.focus)
     }
 }
 
@@ -62,7 +110,7 @@ pub fn request_body(req: &ExplainRequest) -> Value {
     json!({
         "model": req.model,
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "system", "content": req.task.system_prompt() },
             { "role": "user", "content": req.user_prompt() },
         ],
         "max_tokens": req.max_tokens,
@@ -94,7 +142,7 @@ pub fn fetch(req: &ExplainRequest) -> Result<String, ExplainError> {
     runtime.block_on(fetch_async(req))
 }
 
-async fn fetch_async(req: &ExplainRequest) -> Result<String, ExplainError> {
+pub(crate) async fn fetch_async(req: &ExplainRequest) -> Result<String, ExplainError> {
     let timeout = Duration::from_secs(req.timeout_s);
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -132,7 +180,37 @@ mod tests {
             focus: "世界 (せかい)".to_owned(),
             max_tokens: 256,
             timeout_s: 30,
+            task: ExplainTask::Explain,
         }
+    }
+
+    #[test]
+    fn translation_asks_for_a_translation_and_nothing_else() {
+        let config = ExplainConfig::default();
+        let req = ExplainRequest::translation(&config, "私は学生です。".to_owned())
+            .expect("endpoint configured");
+        assert_eq!(req.task, ExplainTask::Translate);
+        let body = request_body(&req);
+        let messages = body["messages"].as_array().unwrap();
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("translate"),
+            "translation has its own system prompt: {}",
+            messages[0]["content"]
+        );
+        let user = messages[1]["content"].as_str().unwrap();
+        assert!(user.contains("私は学生です。"), "{user}");
+        assert!(
+            !user.contains("Focused word"),
+            "a translation request has no focus word: {user}"
+        );
+
+        // An unset endpoint disables it, same as explanations.
+        let mut disabled = config;
+        disabled.endpoint.clear();
+        assert!(ExplainRequest::translation(&disabled, "文".to_owned()).is_none());
     }
 
     #[test]

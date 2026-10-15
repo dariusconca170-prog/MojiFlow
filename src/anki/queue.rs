@@ -44,23 +44,36 @@ impl OfflineQueue {
 
     /// List pending entries oldest-first as `(path, note)`.
     pub fn pending(&self) -> Vec<(PathBuf, PendingNote)> {
+        self.pending_detailed().0
+    }
+
+    /// [`Self::pending`] plus the number of `.json` files that could not be read or parsed.
+    /// Those files are left alone (never deleted): they still hold someone's card, and the
+    /// dashboard should report them instead of silently showing a shorter queue.
+    pub fn pending_detailed(&self) -> (Vec<(PathBuf, PendingNote)>, usize) {
         let Ok(entries) = fs::read_dir(&self.dir) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let mut out = Vec::new();
+        let mut unreadable = 0;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = fs::read(&path) {
-                if let Ok(note) = serde_json::from_slice(&bytes) {
-                    out.push((path, note));
+            match fs::read(&path)
+                .map_err(|err| err.to_string())
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
+            {
+                Ok(note) => out.push((path, note)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %path.display(), "offline queue entry is unreadable");
+                    unreadable += 1;
                 }
             }
         }
         out.sort_by(|(a, _), (b, _)| a.file_name().cmp(&b.file_name()));
-        out
+        (out, unreadable)
     }
 
     /// Number of entries waiting (used by the status strip / retry scheduling).
@@ -125,6 +138,24 @@ mod tests {
         assert_eq!(queue.pending_count(), 2);
         let entries = queue.pending();
         assert_eq!(entries[0].1.fields["Expression"], "食べる");
+        assert_eq!(queue.pending_detailed().1, 0, "nothing unreadable yet");
+    }
+
+    /// A corrupt or half-written entry must be *reported*, not silently invisible: the
+    /// dashboard's count and the files on disk would otherwise disagree with no explanation.
+    #[test]
+    fn unreadable_entries_are_counted_and_kept() {
+        let queue = queue();
+        queue.push(&note()).expect("push");
+        let (_, unreadable_before) = queue.pending_detailed();
+        assert_eq!(unreadable_before, 0);
+        let broken = queue.dir().join("0000000000000000001-deadbeef.json");
+        fs::write(&broken, b"{ this is not json").expect("write broken entry");
+
+        let (entries, unreadable) = queue.pending_detailed();
+        assert_eq!(entries.len(), 1, "the good entry is still listed");
+        assert_eq!(unreadable, 1);
+        assert!(broken.exists(), "an unreadable entry is never deleted");
     }
 
     #[tokio::test]

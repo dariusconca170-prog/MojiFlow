@@ -19,6 +19,8 @@ use crate::error::HotkeyError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
     ExportCard,
+    /// Mine the whole active line as one sentence card (audio + line + translation).
+    ExportSentence,
     OffsetBack,
     OffsetForward,
     ToggleLock,
@@ -37,6 +39,7 @@ impl AppAction {
     pub fn label(self) -> &'static str {
         match self {
             AppAction::ExportCard => "export card",
+            AppAction::ExportSentence => "export sentence",
             AppAction::OffsetBack => "offset back",
             AppAction::OffsetForward => "offset forward",
             AppAction::ToggleLock => "toggle lock",
@@ -59,9 +62,10 @@ pub struct GlobalHotkeys {
 }
 
 /// All `(config spec, action)` pairs the app supports, in registration order.
-pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 12] {
+pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 13] {
     [
         (&config.export_card, AppAction::ExportCard),
+        (&config.export_sentence, AppAction::ExportSentence),
         (&config.offset_back, AppAction::OffsetBack),
         (&config.offset_forward, AppAction::OffsetForward),
         (&config.toggle_lock, AppAction::ToggleLock),
@@ -74,6 +78,86 @@ pub fn configured_actions(config: &HotkeysConfig) -> [(&str, AppAction); 12] {
         (&config.toggle_status, AppAction::ToggleStatus),
         (&config.toggle_dashboard, AppAction::ToggleDashboard),
     ]
+}
+
+/// `(config spec, action)` for the *local* keys — bare keys that only fire while the overlay
+/// is focused (global registration is impossible for them: `global-hotkey` is X11-only, and
+/// binding bare letters globally would steal them from every other app).
+pub fn local_actions(config: &HotkeysConfig) -> [(&str, AppAction); 7] {
+    [
+        (&config.local_export, AppAction::ExportCard),
+        (&config.local_export_sentence, AppAction::ExportSentence),
+        (&config.local_offset_back, AppAction::OffsetBack),
+        (&config.local_offset_forward, AppAction::OffsetForward),
+        (&config.local_clock_start_pause, AppAction::ClockStartPause),
+        (&config.local_seek_back, AppAction::ClockSeekBack),
+        (&config.local_seek_forward, AppAction::ClockSeekForward),
+    ]
+}
+
+/// A local keybinding: one key plus the exact modifier state it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalKey {
+    pub key: egui::Key,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+impl LocalKey {
+    /// True when this key is pressed *with exactly these modifiers*. Exact matching matters:
+    /// the bare local `Space` must not also fire when the global `Ctrl+Alt+Space` is pressed.
+    pub fn pressed(&self, input: &egui::InputState) -> bool {
+        if !input.key_pressed(self.key) {
+            return false;
+        }
+        let expected = egui::Modifiers {
+            alt: self.alt,
+            ctrl: self.ctrl,
+            shift: self.shift,
+            mac_cmd: false,
+            command: self.ctrl,
+        };
+        input.modifiers == expected
+    }
+}
+
+/// Parse one *local* key spec (`"S"`, `"Shift+S"`, `"Space"`, `"ArrowLeft"`). Empty ==
+/// disabled; anything else must parse, or the config typo is a typed error the app reports.
+pub fn parse_local_key(spec: &str) -> Result<Option<LocalKey>, HotkeyError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let invalid = |reason: String| HotkeyError::Parse {
+        spec: trimmed.to_owned(),
+        action: "local key".to_owned(),
+        reason,
+    };
+    let (mut shift, mut ctrl, mut alt) = (false, false, false);
+    let mut key: Option<egui::Key> = None;
+    for part in trimmed.split('+') {
+        let part = part.trim();
+        match part.to_ascii_lowercase().as_str() {
+            "shift" => shift = true,
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            _ => {
+                let parsed = egui::Key::from_name(part)
+                    .ok_or_else(|| invalid(format!("unknown key '{part}'")))?;
+                if key.replace(parsed).is_some() {
+                    return Err(invalid(format!("more than one key in '{trimmed}'")));
+                }
+            }
+        }
+    }
+    let key = key.ok_or_else(|| invalid("no key name (only modifiers)".to_owned()))?;
+    Ok(Some(LocalKey {
+        key,
+        shift,
+        ctrl,
+        alt,
+    }))
 }
 
 /// Parse one config spec into a [`HotKey`]. Empty string == disabled (None). Everything
@@ -198,5 +282,66 @@ mod tests {
             .expect("bare S parses")
             .expect("not disabled");
         assert_eq!(hotkey.to_string(), "KeyS");
+    }
+
+    #[test]
+    fn local_key_specs_resolve_to_egui_keys_and_exact_modifiers() {
+        assert_eq!(
+            parse_local_key("S").expect("parses"),
+            Some(LocalKey {
+                key: egui::Key::S,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            })
+        );
+        assert_eq!(
+            parse_local_key("Shift+S").expect("parses"),
+            Some(LocalKey {
+                key: egui::Key::S,
+                shift: true,
+                ctrl: false,
+                alt: false,
+            })
+        );
+        // Defaults the app ships: `[`/`]` are written as symbols, `Space`/arrows by name.
+        assert_eq!(
+            parse_local_key("[").expect("parses").map(|k| k.key),
+            Some(egui::Key::OpenBracket)
+        );
+        assert_eq!(
+            parse_local_key("Space").expect("parses").map(|k| k.key),
+            Some(egui::Key::Space)
+        );
+        assert_eq!(
+            parse_local_key("ArrowLeft").expect("parses").map(|k| k.key),
+            Some(egui::Key::ArrowLeft)
+        );
+        // Empty = disabled, same convention as the global specs.
+        assert_eq!(parse_local_key("  ").expect("empty is fine"), None);
+    }
+
+    #[test]
+    fn local_key_typos_are_typed_errors() {
+        for spec in ["NotAKey", "Shift", "Shift+S+D"] {
+            let err = parse_local_key(spec).expect_err(spec);
+            assert!(matches!(err, HotkeyError::Parse { .. }), "{spec}");
+        }
+        let err = parse_local_key("Nope").expect_err("typo");
+        assert!(err.to_string().contains("local key"), "{err}");
+    }
+
+    /// Every default local binding must parse: a typo here would silently disable a
+    /// documented bare key rather than report itself.
+    #[test]
+    fn default_local_bindings_all_parse() {
+        let config = HotkeysConfig::default();
+        let actions = local_actions(&config);
+        assert_eq!(actions.len(), 7);
+        for (spec, action) in actions {
+            let parsed = parse_local_key(spec)
+                .unwrap_or_else(|err| panic!("{action:?} spec {spec:?}: {err}"));
+            assert!(parsed.is_some(), "{action:?} must be enabled by default");
+        }
     }
 }
