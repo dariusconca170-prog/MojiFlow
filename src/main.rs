@@ -174,6 +174,14 @@ fn main() -> anyhow::Result<()> {
         // Start click-through; `App::apply_passthrough` re-enables input only while the
         // cursor is over an interactive region (see AGENTS.md).
         .with_mouse_passthrough(true)
+        // X11/KWin fullscreen stacking: a *managed* always-on-top window loses to a
+        // fullscreen player, and the runtime EWMH enforcer can't beat that either. An
+        // override-redirect window is unmanaged, so the WM never restacks it under the
+        // video; `Utility` is the closest EWMH type for a persistent palette. Trade-off:
+        // the WM gives this window no keyboard focus (global hotkeys remain the input
+        // path) and the always-on-top EWMH enforcer becomes a no-op.
+        .with_override_redirect(true)
+        .with_window_type(egui::viewport::X11WindowType::Utility)
         // A negative rect component is the auto bottom-center sentinel — let the WM place
         // the window and let `App` move it on the first frame.
         .with_position([
